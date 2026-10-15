@@ -496,13 +496,14 @@ final class MagneticEngine: ObservableObject {
         }
         liveFilesDir = nil
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        if let name = trackFileName {
-            let src = docs.appendingPathComponent("mag-tracks", isDirectory: true).appendingPathComponent(name)
-            try? FileManager.default.removeItem(at: d.appendingPathComponent("track.csv"))
-            try? FileManager.default.copyItem(at: src, to: d.appendingPathComponent("track.csv"))
-        }
+        let name = trackFileName
         Task {
-            try? await Task.sleep(nanoseconds: 1_500_000_000)     // 等文件写完
+            try? await Task.sleep(nanoseconds: 1_500_000_000)     // 等文件写完（轨迹文件在引擎队列上关闭，关完才有内容）
+            if let name {
+                let src = docs.appendingPathComponent("mag-tracks", isDirectory: true).appendingPathComponent(name)
+                try? FileManager.default.removeItem(at: d.appendingPathComponent("track.csv"))
+                try? FileManager.default.copyItem(at: src, to: d.appendingPathComponent("track.csv"))
+            }
             if let wm {
                 await wm.finish(upload: { await Telemetry.shared.upload(sessionDir: d) })
             } else {
