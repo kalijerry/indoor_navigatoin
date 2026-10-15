@@ -26,6 +26,9 @@ final class MapLibrary: ObservableObject {
         /// 是云端融合的正式版本
         var isCloudFused: Bool { cloudInfo?.origin == "cloud" }
         var isRoom: Bool { kind == "room" }
+        /// 这张地图用不用蓝牙（价签）：nil = 按类型——门店用，房间 / 办公室不用（价签可能堆在一处，会把位置拉过去）
+        var useBLE: Bool?
+        var bleEnabled: Bool { useBLE ?? !isRoom }
     }
 
     @Published private(set) var entries: [Entry] = []
@@ -125,6 +128,17 @@ final class MapLibrary: ObservableObject {
         try activate(e.id)
         return e
     }
+
+    /// 这张地图开 / 关蓝牙（定位、采集都跟着变；云端融合按地图类型）
+    func setBLE(_ id: String, _ on: Bool) {
+        guard let i = entries.firstIndex(where: { $0.id == id }) else { return }
+        entries[i].useBLE = on
+        try? writeMeta(entries[i])
+        AppLog.i("地图库", "「\(entries[i].name)」蓝牙：\(on ? "开" : "关")")
+    }
+
+    /// 在用的地图用不用蓝牙（没有地图库条目时按门店处理）
+    var activeBLEEnabled: Bool { active?.bleEnabled ?? true }
 
     func rename(_ id: String, to name: String) {
         guard let i = entries.firstIndex(where: { $0.id == id }) else { return }
@@ -353,7 +367,8 @@ struct MapLibrarySection: View {
                     Image(systemName: e.isRoom ? "cube.transparent" : "building.2").foregroundStyle(.secondary)
                     VStack(alignment: .leading) {
                         Text(e.name)
-                        Text((e.isRoom ? "房间" : "门店") + " · " + Self.versionText(e)).font(.caption).foregroundStyle(.secondary)
+                        Text((e.isRoom ? "房间" : "门店") + " · " + Self.versionText(e) + (e.bleEnabled ? "" : " · 不用蓝牙"))
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
                     if e.id == lib.activeId {
@@ -367,11 +382,12 @@ struct MapLibrarySection: View {
                         if e.id != lib.activeId { Button("删除", role: .destructive) { lib.delete(e.id) } }
                         Button("改名") { renaming = e; newName = e.name }.tint(.blue)
                     }
+                    Button(e.bleEnabled ? "关蓝牙" : "开蓝牙") { lib.setBLE(e.id, !e.bleEnabled) }.tint(.orange)
                 }
             }
             if let err = lib.lastError { Text(err).font(.footnote).foregroundStyle(.red) }
         } header: { Text("地图库") } footer: {
-            Text("每张地图有自己的磁场图、点位、采集进度和采集会话，切换不会互相覆盖。左滑改名 / 删除。")
+            Text("每张地图有自己的磁场图、点位、采集进度和采集会话，切换不会互相覆盖。左滑改名 / 删除 / 开关蓝牙（房间、办公室默认不用蓝牙）。")
         }
         .alert("改名", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
             TextField("名字", text: $newName)

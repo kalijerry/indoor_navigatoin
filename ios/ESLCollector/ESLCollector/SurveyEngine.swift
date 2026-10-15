@@ -532,7 +532,9 @@ final class SurveyEngine: ObservableObject {
         coverage.sessionActive = true
         lastError = nil
         recorder.deviceLabel = "survey"
-        recorder.recordBLE = true          // 价签广播顺便录下来，生成磁场图时自动做成蓝牙指纹
+        // 价签广播顺便录下来，生成磁场图时自动做成蓝牙指纹；这张地图不用蓝牙（房间 / 办公室）就不录
+        let bleOn = MapLibrary.shared.activeBLEEnabled
+        recorder.recordBLE = bleOn
         recorder.arbiterName = ""
         SensorArbiter.shared.claim("建图采集") { [weak self] in self?.stop() }
         recorder.setupNote = note
@@ -564,7 +566,7 @@ final class SurveyEngine: ObservableObject {
             signCount = 0
             signFixes = 0
             lastSign = nil
-            if bleBase {
+            if bleBase && bleOn {
                 let locs = StoreDataStore.shared.eslLocations
                 bleBaseMap = locs.isEmpty ? MagMapStore.shared.bleMap : EslLocations.seededBLEMap(locs, learned: MagMapStore.shared.bleMap)
                 bleWalk = store.walkableMap()
