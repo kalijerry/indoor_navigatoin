@@ -1,0 +1,133 @@
+name: iOS Ad Hoc (signed)
+
+# 签名的内部测试包（Ad Hoc）：开发者网站上登记过 UDID 的 iPhone 能直接装，签名一年有效。
+# main 有 iOS 改动时自动跑，也可以手动跑（Actions → iOS Ad Hoc (signed) → Run workflow）。
+# 打好的包传到后台，看板「下载」页点「在 iPhone 上安装」（用 iPhone 的 Safari 打开看板）。
+#
+# 需要（环境 ios）：ASC_ISSUER_ID、ASC_KEY_ID、ASC_KEY_P8（App Store Connect API 密钥）、
+# IOS_DIST_P12、IOS_DIST_P12_PASSWORD（Apple Distribution 证书，base64）；仓库变量 IOS_TEAM_ID、IOS_BUNDLE_ID；
+# 仓库密钥 HPASS_URL、HPASS_TOKEN（后台）。
+
+on:
+  push:
+    branches: [main]
+    paths: ["ios/**", ".github/workflows/ios-adhoc.yml", "tools/ios/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ios-adhoc
+  cancel-in-progress: true
+
+jobs:
+  adhoc:
+    runs-on: macos-15
+    environment: ios
+    timeout-minutes: 40
+    env:
+      TEAM_ID: ${{ vars.IOS_TEAM_ID }}
+      BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID || 'com.anixops.navigation.ios' }}
+      PROFILE_NAME: HPASS AdHoc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check configuration
+        env:
+          P12: ${{ secrets.IOS_DIST_P12 }}
+          ASC: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          missing=""
+          [ -n "$TEAM_ID" ] || missing="$missing 仓库变量 IOS_TEAM_ID"
+          [ -n "$P12" ] || missing="$missing 证书 IOS_DIST_P12"
+          [ -n "$ASC" ] || missing="$missing ASC_KEY_P8"
+          if [ -n "$missing" ]; then echo "::warning::签名包没打：缺$missing"; echo "SKIP=1" >> $GITHUB_ENV; fi
+
+      - name: Install signing certificate
+        if: env.SKIP != '1'
+        env:
+          P12: ${{ secrets.IOS_DIST_P12 }}
+          P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+        run: |
+          KC=$RUNNER_TEMP/signing.keychain-db
+          KCPW=$(openssl rand -hex 16)
+          echo "$P12" | base64 --decode > $RUNNER_TEMP/dist.p12
+          security create-keychain -p "$KCPW" "$KC"
+          security set-keychain-settings -lut 3600 "$KC"
+          security unlock-keychain -p "$KCPW" "$KC"
+          security import $RUNNER_TEMP/dist.p12 -k "$KC" -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KCPW" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          security find-certificate -c "Apple Distribution" -p "$KC" | openssl x509 -noout -serial | cut -d= -f2 > $RUNNER_TEMP/serial
+          [ -s $RUNNER_TEMP/serial ] || { echo "证书导入失败（p12 密码不对？）"; exit 1; }
+          echo "CERT_SERIAL=$(cat $RUNNER_TEMP/serial)" >> $GITHUB_ENV
+          rm -f $RUNNER_TEMP/dist.p12
+
+      - name: Ad Hoc provisioning profile (all registered devices)
+        if: env.SKIP != '1'
+        env:
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          pip3 install --quiet --break-system-packages pyjwt cryptography || pip3 install --quiet pyjwt cryptography
+          python3 tools/ios/asc_profile.py
+
+      - name: Generate project (signed settings)
+        if: env.SKIP != '1'
+        working-directory: ios/ESLCollector
+        run: |
+          brew install xcodegen
+          python3 - <<'PY'
+          import os, re
+          p = "project.yml"; s = open(p).read()
+          s = s.replace("PRODUCT_BUNDLE_IDENTIFIER: com.example.eslcollector", "PRODUCT_BUNDLE_IDENTIFIER: " + os.environ["BUNDLE_ID"])
+          s = s.replace("CODE_SIGN_STYLE: Automatic",
+                        "CODE_SIGN_STYLE: Manual\n        DEVELOPMENT_TEAM: " + os.environ["TEAM_ID"] +
+                        "\n        CODE_SIGN_IDENTITY: \"Apple Distribution\"\n        PROVISIONING_PROFILE_SPECIFIER: \"" + os.environ["PROFILE_NAME"] + "\"")
+          s = re.sub(r'CURRENT_PROJECT_VERSION: "\d+"', 'CURRENT_PROJECT_VERSION: "' + os.environ["GITHUB_RUN_NUMBER"] + '"', s)
+          open(p, "w").write(s)
+          PY
+          xcodegen generate
+
+      - name: Archive and export
+        if: env.SKIP != '1'
+        working-directory: ios/ESLCollector
+        run: |
+          set -o pipefail
+          xcodebuild -project ESLCollector.xcodeproj -scheme ESLCollector -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath $RUNNER_TEMP/HPASS.xcarchive archive | tail -50
+          cat > $RUNNER_TEMP/export.plist <<PL
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>ad-hoc</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>provisioningProfiles</key><dict><key>${BUNDLE_ID}</key><string>${PROFILE_NAME}</string></dict>
+            <key>compileBitcode</key><false/>
+            <key>thinning</key><string>&lt;none&gt;</string>
+          </dict></plist>
+          PL
+          xcodebuild -exportArchive -archivePath $RUNNER_TEMP/HPASS.xcarchive -exportOptionsPlist $RUNNER_TEMP/export.plist \
+            -exportPath $RUNNER_TEMP/export | tail -20
+          ls -la $RUNNER_TEMP/export
+
+      - name: Upload to backend
+        if: env.SKIP != '1'
+        env:
+          HPASS_URL: ${{ secrets.HPASS_URL }}
+          HPASS_TOKEN: ${{ secrets.HPASS_TOKEN }}
+          MSG: ${{ github.event.head_commit.message }}
+        run: |
+          IPA=$(ls $RUNNER_TEMP/export/*.ipa | head -1)
+          VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" $RUNNER_TEMP/HPASS.xcarchive/Products/Applications/*.app/Info.plist)
+          NAME="HPASS-adhoc-$(date -u +%Y%m%d-%H%M)-${GITHUB_SHA::7}.ipa"
+          ENC=$(python3 -c 'import os,urllib.parse;m=os.environ.get("MSG","");print(urllib.parse.quote(m.splitlines()[0][:100] if m else "手动打包"))')
+          curl -fsS -X PUT --data-binary @"$IPA" \
+            -H "Authorization: Bearer $HPASS_TOKEN" -H "User-Agent: hpass-ci" \
+            -H "x-build-sha: $GITHUB_SHA" -H "x-build-run: $GITHUB_RUN_ID" -H "x-build-message: $ENC" \
+            -H "x-build-signed: adhoc" -H "x-bundle-id: $BUNDLE_ID" -H "x-bundle-version: $VER" -H "x-build-number: $GITHUB_RUN_NUMBER" \
+            "${HPASS_URL%/}/api/builds/$NAME"
+
+      - name: Clean up keychain
+        if: always()
+        run: security delete-keychain $RUNNER_TEMP/signing.keychain-db 2>/dev/null || true

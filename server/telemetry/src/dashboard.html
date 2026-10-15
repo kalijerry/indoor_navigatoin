@@ -195,7 +195,7 @@ async function loadBuilds() {
   const r = await api("/api/builds"); if (!r.ok) return;
   const list = await r.json();
   $("builds").innerHTML = list.length ? "<tr><th>安装包</th><th>提交</th><th>大小</th><th>构建时间</th></tr>" + list.map((o) =>
-    `<tr><td><a href="#" data-ipa="${esc(o.name)}">${esc(o.name)}</a></td><td title="${esc(o.message)}">${esc(o.sha.slice(0, 7))} ${esc(o.message.slice(0, 40))}</td>` +
+    `<tr><td>${o.install ? `<a href="${esc(o.install)}" style="font-weight:600">📲 在 iPhone 上安装</a> ` : ""}<a href="#" data-ipa="${esc(o.name)}">${esc(o.name)}</a>${o.signed ? ` <span class="kv">（签名 ${esc(o.version || "")} #${esc(o.number || "")}）</span>` : ` <span class="kv">（未签名，Sideloadly 用）</span>`}</td><td title="${esc(o.message)}">${esc(o.sha.slice(0, 7))} ${esc(o.message.slice(0, 40))}</td>` +
     `<td>${(o.size / 1e6).toFixed(1)} MB</td><td>${new Date(o.uploaded).toLocaleString("zh-CN")}</td></tr>`).join("")
     : '<tr><td class="kv">还没有。main 分支 CI 构建完会自动传上来。</td></tr>';
   for (const a of document.querySelectorAll("[data-ipa]")) a.onclick = async (e) => {

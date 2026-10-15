@@ -7,7 +7,9 @@
 // - PUT  /api/maps/<id>          上传地图 JSON（看板画地图用）；GET /api/maps/<id>
 // - PUT  /api/reports/<名字>.json 上传评估报告（hpass-eval 的 --json）；GET /api/reports 列表
 // - GET  /api/logs?day=YYYY-MM-DD 某天的日志分块列表；GET /api/logs/<key> 取一块
-// - PUT  /api/builds/<名字>.ipa   CI 上传安装包（未签名 ipa）；GET /api/builds 列表；GET /api/builds/<名字> 下载
+// - PUT  /api/builds/<名字>.ipa   CI 上传安装包；GET /api/builds 列表；GET /api/builds/<名字> 下载
+// - GET  /ota/<签名>/<名字>.plist|.ipa  签名的 Ad Hoc 包给 iPhone 直接安装（itms-services 不能带口令，用 HMAC 签名的
+//                                    不可猜链接代替；签名只在登录后的 /api/builds 列表里给出）
 //
 // 鉴权：所有接口都要口令（secret TOKEN），放在 Authorization: Bearer … 或 ?token=…（WebSocket 用后者）。
 
@@ -32,6 +34,15 @@ function authorized(request, env, url) {
 
 const safeName = (s) => /^[A-Za-z0-9._\-]{1,120}$/.test(s);
 
+// 安装链接的签名：HMAC-SHA256(口令, 包名) 前 32 位十六进制
+async function otaSig(env, name) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.TOKEN), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode("ota:" + name)));
+  return [...mac].slice(0, 16).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+const xmlEsc = (s) => String(s).replace(/[<>&"']/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&apos;" }[c]));
+
 async function listPrefix(env, prefix, limit = 500) {
   const out = [];
   let cursor;
@@ -51,6 +62,30 @@ export default {
     if (path === "/" || path === "/index.html") {
       return new Response(DASHBOARD, { headers: { "content-type": "text/html; charset=utf-8" } });
     }
+    // 签名的 Ad Hoc 包：iPhone 点「安装」时系统去取 manifest 和 ipa，不能带口令
+    let om = path.match(/^\/ota\/([0-9a-f]{32})\/([^/]+)\.(plist|ipa)$/);
+    if (om && env.TOKEN) {
+      const [, sig, base, ext] = om;
+      const name = base + ".ipa";
+      if (!safeName(name) || sig !== (await otaSig(env, name))) return json({ error: "链接不对" }, 404);
+      const o = ext === "ipa" ? await env.DATA.get("builds/" + name) : await env.DATA.head("builds/" + name);
+      if (!o || (o.customMetadata || {}).signed !== "adhoc") return json({ error: "没有这个安装包" }, 404);
+      if (ext === "ipa") return new Response(o.body, { headers: { "content-type": "application/octet-stream" } });
+      const m = o.customMetadata;
+      const ipaUrl = `${url.origin}/ota/${sig}/${base}.ipa`;
+      const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>items</key><array><dict>
+<key>assets</key><array><dict><key>kind</key><string>software-package</string><key>url</key><string>${xmlEsc(ipaUrl)}</string></dict></array>
+<key>metadata</key><dict>
+<key>bundle-identifier</key><string>${xmlEsc(m.bundle || "")}</string>
+<key>bundle-version</key><string>${xmlEsc(m.version || "0.1.0")}</string>
+<key>kind</key><string>software</string>
+<key>title</key><string>HPASS ${xmlEsc(m.version || "")} (${xmlEsc(m.number || "")})</string>
+</dict></dict></array></dict></plist>`;
+      return new Response(plist, { headers: { "content-type": "application/xml; charset=utf-8" } });
+    }
+
     if (!authorized(request, env, url)) return json({ error: "口令不对" }, 401);
 
     // WebSocket → Hub（全局一个实例）
@@ -172,8 +207,15 @@ export default {
         const r = await env.DATA.list({ prefix: "builds/", cursor, include: ["customMetadata"] });
         for (const o of r.objects) {
           const m = o.customMetadata || {};
-          out.push({ name: o.key.slice("builds/".length), size: o.size, uploaded: o.uploaded,
-                     sha: m.sha || "", message: m.message ? decodeURIComponent(m.message) : "", run: m.run || "" });
+          const name = o.key.slice("builds/".length);
+          const item = { name, size: o.size, uploaded: o.uploaded, sha: m.sha || "",
+                         message: m.message ? decodeURIComponent(m.message) : "", run: m.run || "", signed: m.signed || "" };
+          if (m.signed === "adhoc") {
+            const manifest = `${url.origin}/ota/${await otaSig(env, name)}/${name.replace(/\.ipa$/, "")}.plist`;
+            item.install = "itms-services://?action=download-manifest&url=" + encodeURIComponent(manifest);
+            item.version = m.version || ""; item.number = m.number || "";
+          }
+          out.push(item);
         }
         cursor = r.truncated ? r.cursor : undefined;
       } while (cursor);
@@ -188,7 +230,9 @@ export default {
         const h = (k) => request.headers.get(k) || "";
         await env.DATA.put(key, request.body, {
           httpMetadata: { contentType: "application/octet-stream" },
-          customMetadata: { sha: h("x-build-sha"), message: h("x-build-message"), run: h("x-build-run") },
+          customMetadata: { sha: h("x-build-sha"), message: h("x-build-message"), run: h("x-build-run"),
+                            signed: h("x-build-signed"), bundle: h("x-bundle-id"), version: h("x-bundle-version"),
+                            number: h("x-build-number") },
         });
         // 只留最近 20 个
         const all = await listPrefix(env, "builds/", 1000);
