@@ -290,6 +290,16 @@ final class Telemetry: ObservableObject {
         }
     }
 
+    /// 通用 GET（精度测试取云端报告用）
+    func getData(_ path: String) async throws -> Data {
+        guard var r = request(path, method: "GET") else { throw CloudError.notConfigured }
+        r.timeoutInterval = 30
+        let (d, resp) = try await URLSession.shared.data(for: r)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200 else { throw CloudError.http(code, String(data: d, encoding: .utf8) ?? "") }
+        return d
+    }
+
     /// 后台会话列表的请求（没配地址时 nil）
     func sessionsRequest() -> URLRequest? { request("api/sessions", method: "GET") }
 
