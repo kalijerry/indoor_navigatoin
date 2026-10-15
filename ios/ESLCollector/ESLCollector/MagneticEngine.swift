@@ -164,6 +164,14 @@ final class MagneticEngine: ObservableObject {
     @Published private(set) var searchStarted: Date?
     /// 这次视觉定位成功过几次（跟丢再认出来也算）
     @Published private(set) var visualFixes = 0
+    /// 房间里等视觉认房间：开始时间（nil = 没在等）、超时没认出来的次数
+    @Published private(set) var visualSearchStarted: Date?
+    @Published private(set) var visualTimeouts = 0
+    static let visualTimeoutSec = 45.0
+    private var visualTimer: Timer?
+    private var visualTimeoutCounted = false
+    /// 实时定位结束时的特征地图处理（见 WorldMapKeeper）
+    private var liveWM: WorldMapKeeper.Plan?
 
     /// 当前地图有视觉特征地图（房间扫描时存的）和 ARKit → 地图的变换：可以视觉定位
     var visualAvailable: Bool {
@@ -441,6 +449,9 @@ final class MagneticEngine: ObservableObject {
         headingEditing = false
         hint = nil
         targetId = nil
+        visualFixes = 0
+        visualTimeouts = 0
+        endVisualSearch()
         startMotion(mode: .live)
         startPedometerAndActivity()
         AppLog.i("地磁", "实时定位：打开传感器，视觉里程计 \(useVisualOdometry ? "开" : "关")，深度 \(depthMode.title)，罗盘修正 \(useCompassHeading ? "开" : "关")，地磁纠偏 \(useMagCorrection ? "开" : "关")")
@@ -450,6 +461,9 @@ final class MagneticEngine: ObservableObject {
 
     func stopLive() {
         guard phase == .live else { return }
+        // 房间：认出房间的实时定位，结束时刷新特征地图（30 分钟内刷新过就不重复，免得每次都传几 MB）
+        liveWM = arRunning ? WorldMapKeeper.Plan.make(ar: ar, sessionDir: liveFilesDir, name: "实时定位", minAgeMin: 30) : nil
+        endVisualSearch()
         stopMotion()
         locState = .idle
         queue.async { [pipe] in
@@ -474,7 +488,12 @@ final class MagneticEngine: ObservableObject {
     /// 这次实时定位的完整记录（惯导、磁力计、ARKit、蓝牙、货架标签、定位轨迹）传到后台，电脑上能原样回放分析。
     /// 连着后台才传；不参与建图（meta 里 live = true）。
     private func uploadLiveRecording() {
-        guard let d = liveFilesDir, Telemetry.shared.enabled else { return }
+        let wm = liveWM
+        liveWM = nil
+        guard let d = liveFilesDir, Telemetry.shared.enabled else {
+            if let wm { Task { await wm.finish(upload: nil) } }       // 不上传也要把 ARKit 停掉、刷新本机特征地图
+            return
+        }
         liveFilesDir = nil
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         if let name = trackFileName {
@@ -484,7 +503,11 @@ final class MagneticEngine: ObservableObject {
         }
         Task {
             try? await Task.sleep(nanoseconds: 1_500_000_000)     // 等文件写完
-            _ = await Telemetry.shared.upload(sessionDir: d)
+            if let wm {
+                await wm.finish(upload: { await Telemetry.shared.upload(sessionDir: d) })
+            } else {
+                _ = await Telemetry.shared.upload(sessionDir: d)
+            }
         }
     }
 
@@ -551,6 +574,7 @@ final class MagneticEngine: ObservableObject {
         guard phase == .live, !isTracking else { return }
         let store = MagMapStore.shared
         searchStarted = Date()
+        beginVisualSearch()
         guard let field = store.field else {
             // 没有磁场图，但有视觉特征地图：只靠视觉认房间
             guard visualAvailable else {
@@ -854,9 +878,37 @@ final class MagneticEngine: ObservableObject {
         headingRad = h
         if wasTracking { trail.append(p) } else { trail = [p] }
         visualFixes += 1
+        endVisualSearch()
         UINotificationFeedbackGenerator().notificationOccurred(.success)
         AppLog.i("地磁", "视觉定位成功：\(p)，朝向 \(Int(h * 180 / Double.pi))°"
                  + (before.map { "，修正前偏 \(Int($0.distance(to: p))) cm" } ?? ""))
+    }
+
+    // MARK: 房间视觉认房间的等待状态
+
+    private func beginVisualSearch() {
+        guard visualAvailable else { return }
+        visualSearchStarted = Date()
+        visualTimeoutCounted = false
+        visualTimer?.invalidate()
+        visualTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.visualTick() }
+        }
+    }
+
+    private func visualTick() {
+        guard let s = visualSearchStarted, searching else { endVisualSearch(); return }
+        if !visualTimeoutCounted, Date().timeIntervalSince(s) >= Self.visualTimeoutSec {
+            visualTimeoutCounted = true
+            visualTimeouts += 1
+            AppLog.w("地磁", "视觉认房间超过 \(Int(Self.visualTimeoutSec)) 秒还没认出来（本次第 \(visualTimeouts) 次超时），继续等")
+        }
+    }
+
+    private func endVisualSearch() {
+        visualTimer?.invalidate()
+        visualTimer = nil
+        if visualSearchStarted != nil { visualSearchStarted = nil }
     }
 
     /// 在 p 以朝向 heading 重新开始推算（换一个新引擎，步数累加）。
@@ -943,7 +995,7 @@ final class MagneticEngine: ObservableObject {
             pipe.imuWriter?.close(); pipe.imuWriter = nil
             pipe.rawWriter?.close(); pipe.rawWriter = nil
         }
-        ar.stop()
+        if liveWM?.defersStop != true { ar.stop() }      // 要刷新特征地图的话，取完再停（Plan.finish）
         arRunning = false
         arAlignment = nil
         arFloorY = nil
@@ -1173,6 +1225,7 @@ final class MagneticEngine: ObservableObject {
                 return "听到的价签大多不在蓝牙指纹里：你可能在没采集过的区域，这里没法自动定位。走到采集过的通道（地图上绿色），或长按地图定点。"
             }
             if visualAvailable && arRunning {
+                if phase == .live { return nil }           // 实时定位页由 VisualRelocalizeBanner 显示
                 return "正在认房间：拿着手机对着墙和家具慢慢转一圈（视觉定位，一般几秒）。" +
                     (MagMapStore.shared.field != nil ? "同时也在用地磁找。" : "")
             }

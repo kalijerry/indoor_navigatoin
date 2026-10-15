@@ -489,6 +489,9 @@ final class SurveyEngine: ObservableObject {
         ar.onFloor = { [weak self] y in
             Task { @MainActor in self?.arFloorY = y }
         }
+        ar.onRelocalized = { [weak self] cam in
+            Task { @MainActor in self?.handleRelocalized(cam) }
+        }
         recorder.tap.ble = { [weak self] t, id, rssi in
             Task { @MainActor in self?.bleReading(tMs: t, id: id, rssi: rssi) }
         }
@@ -575,8 +578,11 @@ final class SurveyEngine: ObservableObject {
             disagreeTicks = 0; lastBleCorrectionMs = 0
             anchorsWriter = try CSVWriter(url: dir.appendingPathComponent("anchors.csv"),
                                           header: "t_ms,kind,map_x_cm,map_y_cm,ar_x_cm,ar_z_cm,heading_rad,note")
+            // 房间且有视觉特征地图：载入它，认出房间后 AR 坐标系就是房间扫描时的，旋转和位置都由 arAlign 精确给出
+            let wm = WorldMapKeeper.loadActive()
             try ar.start(dir: dir, wantsDepth: true, lateralFile: dir.appendingPathComponent("depth_lateral.csv"),
-                         wantsMesh: scanMesh)
+                         wantsMesh: scanMesh, worldMap: wm)
+            if wm != nil { AppLog.i("建图", "已载入视觉特征地图：对着房间慢慢转一圈，认出房间会自动定好起点和朝向") }
             arFloorY = nil
             arAlignment = nil
         } catch {
@@ -622,7 +628,9 @@ final class SurveyEngine: ObservableObject {
                 AppLog.e("建图", "导出网格失败：\(error.localizedDescription)")
             }
         }
-        ar.stop()
+        // 房间：认出房间的会话要先取特征地图再暂停 ARKit（见 WorldMapKeeper）
+        let wmPlan = WorldMapKeeper.Plan.make(ar: ar, sessionDir: lastSessionDir, name: "建图")
+        if !wmPlan.defersStop { ar.stop() }
         arAlignment = nil
         stopShadow()
         if evaluate, let s = evalSummary { AppLog.i("建图", "地磁定位精度：\(s)") }
@@ -638,9 +646,11 @@ final class SurveyEngine: ObservableObject {
         headingEditing = false
         SensorArbiter.shared.release("建图采集")
         UIApplication.shared.isIdleTimerDisabled = false
+        var uploadJob: (() async -> Bool)?
         if Telemetry.shared.enabled && Telemetry.shared.autoUpload, let dir = lastSessionDir {
-            Task { _ = await Telemetry.shared.upload(sessionDir: dir) }
+            uploadJob = { await Telemetry.shared.upload(sessionDir: dir) }
         }
+        Task { await wmPlan.finish(upload: uploadJob) }
         AppLog.i("建图", "结束：走了 \(Fmt.f(totalWalkedM, 0)) m，修正 \(anchorCount) 次，自动贴通道 \(lockFixes) 次"
                  + (lock.map { "（累计转 \(Fmt.f($0.totalAbsAngle * 180 / Double.pi, 1))°）" } ?? ""))
     }
@@ -685,6 +695,42 @@ final class SurveyEngine: ObservableObject {
             return
         }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+    }
+
+    // MARK: 视觉重定位（房间）
+
+    /// 载入特征地图后 ARKit 认出了房间：此刻起 AR 坐标系就是房间扫描时的，用地图里的 arAlign 精确定位和定朝向。
+    private func handleRelocalized(_ cam: simd_float4x4) {
+        guard stage != .idle, let t = StoreDataStore.shared.map?.arAlign else { return }
+        let a = Point2(Double(cam.columns.3.x) * 100, Double(cam.columns.3.z) * 100)
+        let p = t.toMap(a)
+        let store = MagMapStore.shared
+        guard WorldMapPolicy.isInside(p, widthCm: store.widthCm, heightCm: store.heightCm) else {
+            AppLog.w("建图", "视觉重定位的位置 \(p) 在地图外，忽略")
+            return
+        }
+        switch stage {
+        case .needPosition, .autoLocating:
+            autoStart(at: p, ar: a, phi: t.phi, uncertainty: 30)
+            AppLog.i("建图", "认出房间，视觉定了起点和朝向")
+        default:
+            // 已经有锚点：把位置和旋转拉到特征地图给出的值（ARKit 认出房间时坐标会跳一下，这一小段轨迹可能不准）
+            pRef = p
+            aRef = a
+            phi = t.phi
+            position = p
+            lastMapPos = p
+            trail.append(p)
+            walkedSinceAnchorM = 0
+            lock?.reset()
+            coverage.breakPaintStroke()
+            writeAnchor(kind: "reanchor", map: p, ar: a, heading: nil, note: "视觉重定位")
+            writeAnchor(kind: "align", map: p, ar: a, heading: t.phi, note: "视觉重定位")
+            stage = .tracking
+            publishAlignment()
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            AppLog.w("建图", "建图中途认出房间，位置和朝向重新对齐：\(p)")
+        }
     }
 
     // MARK: 蓝牙打底

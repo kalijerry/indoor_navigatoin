@@ -35,6 +35,12 @@ final class ARKitLogger: NSObject, ARSessionDelegate {
     var onFrame: ((ARFrame, Int64) -> Void)?
     private var usingWorldMap = false
     private var relocalizing = false
+    // 这一轮（start 到 stop）的视觉特征地图状态；回调在 ARKit 队列，界面线程读，加锁
+    private let runLock = NSLock()
+    private var _runId = 0
+    private var _startedAt: Date?
+    private var _sawRelocalizing = false
+    private var _frameShared = false
 
     /// 给 AR 叠加画面共用的会话（ARSCNView.session = 它）。
     let session = ARSession()
@@ -93,6 +99,12 @@ final class ARKitLogger: NSObject, ARSessionDelegate {
         cfg.initialWorldMap = worldMap
         usingWorldMap = worldMap != nil
         relocalizing = worldMap != nil
+        runLock.lock()
+        _runId += 1
+        _startedAt = Date()
+        _sawRelocalizing = false
+        _frameShared = false
+        runLock.unlock()
         session.run(cfg, options: [.resetTracking, .removeExistingAnchors])
     }
 
@@ -113,14 +125,54 @@ final class ARKitLogger: NSObject, ARSessionDelegate {
         switch camera.trackingState {
         case .limited(.relocalizing):
             relocalizing = true
+            runLock.lock(); _sawRelocalizing = true; runLock.unlock()
         case .normal:
             if relocalizing {
                 relocalizing = false
+                // 确实经过「重定位中」再恢复正常，才算 AR 坐标系和特征地图一致（刷新特征地图的前提）
+                runLock.lock(); if _sawRelocalizing { _frameShared = true }; runLock.unlock()
                 onRelocalized?(camera.transform)
             }
         default:
             break
         }
+    }
+
+    // MARK: 视觉特征地图的保存
+
+    /// 这一轮的编号（每次 start 加 1）；异步保存完要先核对，免得碰到下一轮
+    var runId: Int { runLock.lock(); defer { runLock.unlock() }; return _runId }
+    var runStartedAt: Date? { runLock.lock(); defer { runLock.unlock() }; return _startedAt }
+    /// 这一轮载入了特征地图
+    var loadedWorldMap: Bool { usingWorldMap }
+    /// 这一轮认出过房间：AR 坐标系和载入的特征地图是同一个
+    var frameSharedWithWorldMap: Bool { runLock.lock(); defer { runLock.unlock() }; return _frameShared }
+
+    /// 此刻的状态：跟踪是否正常、建图状态够不够（mapped / extending）、相机位姿
+    func worldMapSnapshot() -> (trackingNormal: Bool, mappedEnough: Bool, camera: simd_float4x4?) {
+        guard let f = session.currentFrame else { return (false, false, nil) }
+        var normal = false
+        if case .normal = f.camera.trackingState { normal = true }
+        let mapped = f.worldMappingStatus == .mapped || f.worldMappingStatus == .extending
+        return (normal, mapped, f.camera.transform)
+    }
+
+    /// 取当前特征地图（归档好的字节）。回调在主线程以外的线程也可能发生。
+    func captureWorldMap(_ done: @escaping @Sendable (Data?, String?) -> Void) {
+        session.getCurrentWorldMap { map, err in
+            guard let map else { done(nil, err?.localizedDescription ?? "未知原因"); return }
+            do {
+                done(try NSKeyedArchiver.archivedData(withRootObject: map, requiringSecureCoding: true), nil)
+            } catch {
+                done(nil, error.localizedDescription)
+            }
+        }
+    }
+
+    /// 仍是这一轮才暂停（异步保存期间如果又开始了新的一轮，别把新的停掉）
+    func stopIfCurrent(_ id: Int) {
+        guard runId == id else { return }
+        stop()
     }
 
     /// 读视觉特征地图文件
