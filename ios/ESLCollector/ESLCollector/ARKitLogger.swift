@@ -35,6 +35,16 @@ final class ARKitLogger: NSObject, ARSessionDelegate {
     var onFrame: ((ARFrame, Int64) -> Void)?
     private var usingWorldMap = false
     private var relocalizing = false
+    // 认出房间后先等位姿稳定再回调：ARKit 刚认出时可能先给一个错的匹配，零点几秒后再跳到对的位置（实测跳了 13 m）。
+    // 只在 ARKit 的回调队列上读写。
+    private var relocPending = false
+    private var relocStableFrames = 0
+    private var relocConfirmed = false
+    private var lastNormalPose: SIMD3<Float>?
+    /// 连续这么多帧（30 Hz）没有跳变才算认稳了
+    private static let relocStableNeeded = 30
+    /// 相邻两帧（1/30 秒）位姿跳这么远（米）= ARKit 重新校正了坐标系
+    private static let relocJumpM: Float = 0.5
     // 这一轮（start 到 stop）的视觉特征地图状态；回调在 ARKit 队列，界面线程读，加锁
     private let runLock = NSLock()
     private var _runId = 0
@@ -93,6 +103,7 @@ final class ARKitLogger: NSObject, ARSessionDelegate {
         let cfg = makeConfig(worldMap: worldMap)
         usingWorldMap = worldMap != nil
         relocalizing = worldMap != nil
+        queue.sync { relocPending = false; relocStableFrames = 0; relocConfirmed = false; lastNormalPose = nil }
         runLock.lock()
         _runId += 1
         _startedAt = Date()
@@ -123,6 +134,7 @@ final class ARKitLogger: NSObject, ARSessionDelegate {
         _sawRelocalizing = false
         _frameShared = false
         runLock.unlock()
+        queue.async { self.relocPending = false; self.relocConfirmed = false; self.lastNormalPose = nil }
         session.run(makeConfig(worldMap: nil), options: [.resetTracking, .removeExistingAnchors])
     }
 
@@ -133,6 +145,25 @@ final class ARKitLogger: NSObject, ARSessionDelegate {
             writer = nil
             lateralWriter?.close()
             lateralWriter = nil
+        }
+    }
+
+    /// 认出房间后的位姿稳定检查（30 Hz）：
+    /// - 刚认出：连续 1 秒没有跳变才回调 onRelocalized（期间 ARKit 自己纠正的跳变会让计时重来）；
+    /// - 已经认稳之后又突然跳一大步（ARKit 又校正了一次坐标系）：重新计时，稳了再回调一次，让定位跟着改。
+    private func checkRelocalization(_ camera: ARCamera, _ m: simd_float4x4) {
+        guard case .normal = camera.trackingState else { lastNormalPose = nil; return }
+        let p = SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z)
+        if let lp = lastNormalPose, simd_distance(p, lp) > Self.relocJumpM {
+            if relocConfirmed || relocPending { relocPending = true; relocStableFrames = 0 }
+        }
+        lastNormalPose = p
+        guard relocPending else { return }
+        relocStableFrames += 1
+        if relocStableFrames >= Self.relocStableNeeded {
+            relocPending = false
+            relocConfirmed = true
+            onRelocalized?(m)
         }
     }
 
@@ -149,7 +180,9 @@ final class ARKitLogger: NSObject, ARSessionDelegate {
                 relocalizing = false
                 // 确实经过「重定位中」再恢复正常，才算 AR 坐标系和特征地图一致（刷新特征地图的前提）
                 runLock.lock(); if _sawRelocalizing { _frameShared = true }; runLock.unlock()
-                onRelocalized?(camera.transform)
+                // 先不回调：等位姿稳定 1 秒（见 didUpdate frame）
+                relocPending = true
+                relocStableFrames = 0
             }
         default:
             break
@@ -205,6 +238,7 @@ final class ARKitLogger: NSObject, ARSessionDelegate {
         let t = Int64(((epochOffset + frame.timestamp) * 1000).rounded())
         let m = frame.camera.transform
         let p = m.columns.3
+        if usingWorldMap { checkRelocalization(frame.camera, m) }
         let q = simd_quatf(m)
         var state = 0
         var reason = 0
