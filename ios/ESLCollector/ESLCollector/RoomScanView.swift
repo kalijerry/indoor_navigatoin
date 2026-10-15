@@ -141,7 +141,11 @@ final class RoomScanModel: ObservableObject {
             try json.write(to: dir.appendingPathComponent("map.json"))
             try? room.export(to: dir.appendingPathComponent("room.usdz"))
             if let raw = try? JSONEncoder().encode(room) { try? raw.write(to: dir.appendingPathComponent("captured_room.json")) }
-            if let wm = pendingWorldMap { try? wm.write(to: dir.appendingPathComponent(MapLibrary.worldMapFile)) }
+            if let wm = pendingWorldMap {
+                try? wm.write(to: dir.appendingPathComponent(MapLibrary.worldMapFile))
+                // 记下这份特征地图对应的 AR 对齐（之后的会话认出房间才能刷新它）
+                WorldMapKeeper.noteScanned(dir: dir, align: map.arAlign, bytes: wm.count)
+            }
             result = map
             resultItem = RoomScanItem(dir: dir)
             // 直接加进地图库并切换过去：到「地磁定位」页就是这个房间
@@ -173,7 +177,9 @@ final class RoomScanModel: ObservableObject {
                 let d = try Data(contentsOf: it.mapURL)
                 let n = name ?? (try? StoreDataLoader.loadMap(d))?.floorName ?? it.id
                 let wm = it.dir.appendingPathComponent(MapLibrary.worldMapFile)
-                let extra = FileManager.default.fileExists(atPath: wm.path) ? [wm] : []
+                let side = it.dir.appendingPathComponent(WorldMapSidecar.fileName)
+                let extra = FileManager.default.fileExists(atPath: wm.path)
+                    ? [wm] + (FileManager.default.fileExists(atPath: side.path) ? [side] : []) : []
                 let e = try lib.importAndActivate(data: d, name: n, kind: "room", extraFiles: extra)
                 try? Data(e.id.utf8).write(to: it.dir.appendingPathComponent("library_id.txt"))
             }

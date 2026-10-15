@@ -70,6 +70,8 @@ final class MapLibrary: ObservableObject {
         return FileManager.default.fileExists(atPath: u.path) ? u : nil
     }
     var activeWorldMapURL: URL? { activeId.flatMap(worldMapURL) }
+    /// 这张地图的目录（特征地图和它的说明 worldmap.json 放这里）
+    func mapDir(_ id: String) -> URL { dir(id) }
 
     private init() {
         load()
@@ -252,7 +254,10 @@ final class MapLibrary: ObservableObject {
             if let i = entries.firstIndex(where: { $0.id == m.id }) { entries[i] = e }
             try writeMeta(e)
         }
-        if let wm = c.worldMap { try wm.write(to: dir(m.id).appendingPathComponent(Self.worldMapFile)) }
+        if let wm = c.worldMap {
+            try wm.write(to: dir(m.id).appendingPathComponent(Self.worldMapFile))
+            WorldMapKeeper.noteInstalled(id: m.id, mapJSON: c.mapJSON, bytes: wm.count, createdMs: m.version)
+        }
         // 工作区：在用的地图写到 Documents 根目录，否则写进这张地图的 workspace 目录
         let isActive = m.id == activeId
         let ws = isActive ? Self.docs : dir(m.id).appendingPathComponent("workspace", isDirectory: true)

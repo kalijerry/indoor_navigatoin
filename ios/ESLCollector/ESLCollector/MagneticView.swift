@@ -1043,10 +1043,11 @@ struct MagneticView: View {
                 }
                 Text("位置不对或定不上：让摄像头扫到货架立柱上的黄色标签（如 082-20），或把手机贴近任意一片价签 2 秒。地磁位置和价签对不上时会先显示「定位中」，不会乱给位置。")
                     .font(.caption).foregroundStyle(.secondary)
-                if engine.visualFixes > 0 {
-                    row("视觉定位", "成功 \(engine.visualFixes) 次").font(.footnote)
+                if engine.visualFixes > 0 || engine.visualTimeouts > 0 {
+                    row("视觉定位", "认出 \(engine.visualFixes) 次" + (engine.visualTimeouts > 0 ? "，超时没认出 \(engine.visualTimeouts) 次" : "")).font(.footnote)
                 }
                 Text(liveInstruction).font(.callout)
+                VisualRelocalizeBanner(engine: engine)
                 if let t = engine.locStateText {
                     Text(t).font(.callout.weight(.semibold))
                         .foregroundStyle(engine.locState == .lost ? .orange : .blue)
