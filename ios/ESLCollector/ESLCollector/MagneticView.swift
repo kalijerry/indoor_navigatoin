@@ -43,6 +43,8 @@ struct MagneticView: View {
     private var paintMode: Bool { coverageLayer == "paint" }
     @State private var confirmResetCoverage = false
     @State private var surveyNote = ""
+    /// 这次采集是从「精度测试」页开始的（结束后把测试会话开关还原）
+    @State private var accuracyTestRunning = false
     enum Camera3D: String, CaseIterable, Identifiable {
         case follow = "跟随", overview = "总览", top = "俯视"
         var id: String { rawValue }
@@ -142,7 +144,12 @@ struct MagneticView: View {
         }
         // 通道变了（换地图、装上云端新版本）：重建采集进度 / 涂色网格
         .onChange(of: store.crosses.count) { _ in configureCoverage() }
-        .onChange(of: survey.isRunning) { running in if !running { mapService.refresh() } }
+        .onChange(of: survey.isRunning) { running in
+            if !running {
+                mapService.refresh()
+                if accuracyTestRunning { accuracyTestRunning = false; survey.isTestSession = false }
+            }
+        }
         .onChange(of: survey.lastSessionDir) { _ in exportURL = nil; exportError = nil }
     }
 
@@ -558,6 +565,19 @@ struct MagneticView: View {
                 .font(.footnote).foregroundStyle(.secondary)
             NavigationLink { DataManagerView() } label: {
                 Label("数据管理（会话、轨迹、网格、AR 记录）", systemImage: "externaldrive")
+            }
+            NavigationLink {
+                AccuracyTestView(survey: survey, mapService: mapService) {
+                    // 测试会话：不参与建图，同时在手机上测精度；结束后自动恢复成普通采集
+                    accuracyTestRunning = true
+                    survey.isTestSession = true
+                    survey.evaluate = store.field != nil
+                    step = .survey
+                    survey.start(note: "精度测试")
+                    if !survey.isRunning { accuracyTestRunning = false; survey.isTestSession = false }   // 没启动成功
+                }
+            } label: {
+                Label("精度测试（走测试会话，看定位准不准）", systemImage: "scope")
             }
             if mode.developer {
                 LoggedButton(name: "实验功能", detail: "进入") { step = .advanced } label: {
