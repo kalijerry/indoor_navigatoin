@@ -7,6 +7,7 @@ import HPASSKit
 //   hpass-build --map map.json --sessions 目录1,目录2,… [--test 测试会话,…] [--esl-ids 价签名单.txt]
 //               --id 地图编号 --name 名字 [--kind store|room] [--bearing 316]
 //               [--esl-locations 价签位置表.csv（也打进包里）] --out 包.hpmp --report 报告.json [--runs 3]
+//               [--worldmap 视觉特征地图文件（房间；打进包里，≤15 MB，>8 MB 报告里警告）]
 //               [--live 实时定位记录目录1,目录2,…]  地图自愈：普通定位记录里可信的路段低权重并进磁场图（见 LiveRunLoader / LiveFieldMerger）
 
 func arg(_ name: String) -> String? {
@@ -252,6 +253,22 @@ do {
             bearing = b
         }
     }
+    // 视觉特征地图（房间）：云端脚本已经挑好、确认过坐标系和地图的 arAlign 一致，这里只管大小
+    var worldMap: Data?
+    var wmWarnings: [String] = []
+    if let wp = arg("--worldmap") {
+        if let d = try? Data(contentsOf: URL(fileURLWithPath: wp)), !d.isEmpty {
+            if let why = WorldMapPolicy.sizeProblem(d.count) {
+                wmWarnings.append("视觉特征地图\(why)，没打进包")
+            } else {
+                worldMap = d
+                if d.count > WorldMapPolicy.warnBytes { wmWarnings.append("视觉特征地图 \(d.count / 1024 / 1024) MB，超过 \(WorldMapPolicy.warnBytes / 1024 / 1024) MB，手机下载会偏慢") }
+                print("视觉特征地图 \(d.count / 1024) KB 打进包")
+            }
+        } else {
+            wmWarnings.append("视觉特征地图读不出来：\(wp)，没打进包")
+        }
+    }
     // 打包
     var meta = MapPackage.Meta(id: id, name: arg("--name") ?? id, kind: arg("--kind") ?? (map.crosses.isEmpty ? "room" : "store"),
                                version: Int64((Date().timeIntervalSince1970 * 1000).rounded()),
@@ -261,11 +278,11 @@ do {
     meta.origin = "cloud"
     meta.sessions = keptSessions.count - magExcluded.count
     meta.bleTags = ble?.tags.count
-    let pkg = try MapPackage.encode(meta: meta, mapJSON: mapData, field: rm.field, ble: ble, worldMap: nil, paint: paint?.serialized(), eslCSV: meta.kind == "store" ? eslCSV : nil,
+    let pkg = try MapPackage.encode(meta: meta, mapJSON: mapData, field: rm.field, ble: ble, worldMap: worldMap, paint: paint?.serialized(), eslCSV: meta.kind == "store" ? eslCSV : nil,
                                      direction: map.crosses.isEmpty ? nil : try JSONEncoder().encode(DirectionCoverage.build(crosses: map.crosses, tracks: rm.tracks)))
     try pkg.write(to: URL(fileURLWithPath: out))
     print("地图包 \(pkg.count / 1024) KB → \(out)")
-    var warnings: [String] = []
+    var warnings: [String] = wmWarnings
     if !magExcluded.isEmpty { warnings.append("磁场图没用（和主体重叠不够）：\(magExcluded.joined(separator: "、"))；补采一段重叠后自动加入") }
     if let rp = arg("--report") {
         let rep = Report(mapId: id, name: meta.name, version: meta.version, sessions: rm.sessions, components: r.components,
