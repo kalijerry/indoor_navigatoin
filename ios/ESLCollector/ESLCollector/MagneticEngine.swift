@@ -103,6 +103,9 @@ private final class MagPipeline {
     var lastBleApply: Int64 = 0
     /// 上次「贴近价签」定位的时间
     var lastTouchMs: Int64 = 0
+    /// 视觉认出了房间：ARKit 坐标系就是房间扫描时的，位置直接 = arAlign(ARKit 位姿)（实测误差 0.1～0.6 m），
+    /// 不再让地磁滤波器改（没采过地磁的房间里，地磁会锁到 13 m 外长得像的地方）
+    var visualLock: MapARTransform?
     /// 实时定位录下来的蓝牙 / 货架标签（和 imu、mag_raw 一起上传，电脑上能原样回放）
     var bleWriter: CSVWriter?
     var rawLastA: Point2?
@@ -472,6 +475,7 @@ final class MagneticEngine: ObservableObject {
             pipe.tracking = false
             pipe.bleWriter?.close()
             pipe.bleWriter = nil
+            pipe.visualLock = nil
         }
         liveSignsWriter?.close()
         liveSignsWriter = nil
@@ -870,6 +874,7 @@ final class MagneticEngine: ObservableObject {
         restartTracking(at: p, heading: h, checkLabel: "视觉定位", isCorrection: wasTracking)
         queue.sync {
             pipe.aligner.set(t, ar: a)
+            pipe.visualLock = t
             pipe.vioPending = nil
             pipe.vioRaw = false
             pipe.vioActive = true
@@ -1548,7 +1553,14 @@ final class MagneticEngine: ObservableObject {
             var shown = position
             var unc = 30.0
             var est: MagneticEstimate?
-            if let loc = pipe.localizer {
+            var src = "vio"
+            if let lock = pipe.visualLock, state == 2 {
+                // 认出了房间：位置直接用视觉（ARKit 位姿经房间扫描时的变换），地磁不参与
+                shown = lock.toMap(a)
+                pipe.pos = shown
+                unc = 30
+                src = "visual"
+            } else if let loc = pipe.localizer {
                 let lat = pipe.pendingLateral
                 pipe.pendingLateral = nil
                 bleTick(pipe: pipe, tMs: t, loc: loc)
@@ -1565,7 +1577,7 @@ final class MagneticEngine: ObservableObject {
             var hd = h * 180 / Double.pi
             if hd < 0 { hd += 360 }
             emit(pipe: pipe, tMs: t, shown: shown, unc: unc, est: est, heading: h, headingDeg: hd,
-                 src: "vio", feature: pipe.latest)
+                 src: src, feature: pipe.latest)
         }
     }
 
