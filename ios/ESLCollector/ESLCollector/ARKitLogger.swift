@@ -90,13 +90,7 @@ final class ARKitLogger: NSObject, ARSessionDelegate {
                                           header: "t_ms,left_cm,right_cm,left_n,right_n,fwd_ar_x,fwd_ar_z")
         }
         frameCounter = 0
-        let cfg = ARWorldTrackingConfiguration()
-        cfg.worldAlignment = .gravity
-        cfg.planeDetection = [.horizontal]                  // 用来找地面高度（AR 叠加要把地图贴在地上）
-        if self.wantsMesh { cfg.sceneReconstruction = .mesh }
-        cfg.environmentTexturing = .none
-        if self.wantsDepth { cfg.frameSemantics = .sceneDepth }
-        cfg.initialWorldMap = worldMap
+        let cfg = makeConfig(worldMap: worldMap)
         usingWorldMap = worldMap != nil
         relocalizing = worldMap != nil
         runLock.lock()
@@ -106,6 +100,30 @@ final class ARKitLogger: NSObject, ARSessionDelegate {
         _frameShared = false
         runLock.unlock()
         session.run(cfg, options: [.resetTracking, .removeExistingAnchors])
+    }
+
+    private func makeConfig(worldMap: ARWorldMap?) -> ARWorldTrackingConfiguration {
+        let cfg = ARWorldTrackingConfiguration()
+        cfg.worldAlignment = .gravity
+        cfg.planeDetection = [.horizontal]                  // 用来找地面高度（AR 叠加要把地图贴在地上）
+        if wantsMesh { cfg.sceneReconstruction = .mesh }
+        cfg.environmentTexturing = .none
+        if wantsDepth { cfg.frameSemantics = .sceneDepth }
+        cfg.initialWorldMap = worldMap
+        return cfg
+    }
+
+    /// 载入了特征地图但一直没认出房间（不在这个房间 / 环境变化太大）：ARKit 会一直停在「重新定位中」，
+    /// 位姿不可用、走路也不动。丢掉特征地图、按普通模式重新跟踪（写文件不中断，坐标系重新开始）。
+    func dropWorldMap() {
+        guard usingWorldMap else { return }
+        usingWorldMap = false
+        relocalizing = false
+        runLock.lock()
+        _sawRelocalizing = false
+        _frameShared = false
+        runLock.unlock()
+        session.run(makeConfig(worldMap: nil), options: [.resetTracking, .removeExistingAnchors])
     }
 
     func stop() {

@@ -907,7 +907,10 @@ final class MagneticEngine: ObservableObject {
         if !visualTimeoutCounted, Date().timeIntervalSince(s) >= Self.visualTimeoutSec {
             visualTimeoutCounted = true
             visualTimeouts += 1
-            AppLog.w("地磁", "视觉认房间超过 \(Int(Self.visualTimeoutSec)) 秒还没认出来（本次第 \(visualTimeouts) 次超时），继续等")
+            // 一直认不出（多半不在这个房间）：丢掉特征地图，ARKit 按普通模式跟踪，不然视觉里程计一直不可用
+            ar.dropWorldMap()
+            AppLog.w("地磁", "视觉认房间超过 \(Int(Self.visualTimeoutSec)) 秒还没认出来，改成普通跟踪（只用地磁 + ARKit）")
+            endVisualSearch()
         }
     }
 
