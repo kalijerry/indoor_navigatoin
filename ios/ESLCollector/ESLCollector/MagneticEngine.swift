@@ -677,6 +677,12 @@ final class MagneticEngine: ObservableObject {
     }
 
     private func startBLE() {
+        // 这张地图不用蓝牙（房间 / 办公室默认）：定位不开蓝牙，只在找价签时开扫描
+        guard MapLibrary.shared.activeBLEEnabled else {
+            AppLog.i("地磁", "这张地图不用蓝牙：只用地磁 + ARKit（+ 视觉定位）")
+            startFinderScanOnly()
+            return
+        }
         guard let m = bleBaseMap(), !m.tags.isEmpty else { startFinderScanOnly(); return }
         let pipe = self.pipe, queue = self.queue
         queue.sync { pipe.bleMap = m; pipe.bleAssist = nil; pipe.bleWindow = []; pipe.lastBleApply = 0 }

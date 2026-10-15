@@ -192,7 +192,10 @@ do {
         eslMismatches = EslLocations.mismatches(locs, learned: learnedBLE).map { "\($0.id) \($0.shelf) 差 \(Int($0.distanceCm / 100)) m" }
         print("价签位置表：\(locs.count) 个，对上货架 \(locs.filter { $0.position != nil }.count) 个；合并后 \(bleMap.tags.count) 个；表里可能不对 \(eslMismatches.count) 个")
     }
-    let ble: BLEFingerprintMap? = bleMap.tags.count >= 20 ? bleMap : nil
+    // 房间 / 办公室不用蓝牙（价签可能堆在一处，会把位置拉过去）：包里不放蓝牙
+    let isRoomMap = (arg("--kind") ?? (map.crosses.isEmpty ? "room" : "store")) == "room"
+    if isRoomMap && !bleMap.tags.isEmpty { print("房间地图：不用蓝牙（\(bleMap.tags.count) 个价签不打包）") }
+    let ble: BLEFingerprintMap? = !isRoomMap && bleMap.tags.count >= 20 ? bleMap : nil
     // 覆盖率：按所有会话的轨迹涂色
     var coverage: Double?, covered: Double?, walkableM2: Double?
     var unfinished: [String] = []
