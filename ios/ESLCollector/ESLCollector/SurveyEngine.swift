@@ -534,6 +534,7 @@ final class SurveyEngine: ObservableObject {
         if coverage.zoneId == nil { coverage.assignZone() }
         coverage.sessionActive = true
         lastError = nil
+        worldMapGivenUp = false
         recorder.deviceLabel = "survey"
         // 价签广播顺便录下来，生成磁场图时自动做成蓝牙指纹；这张地图不用蓝牙（房间 / 办公室）就不录
         let bleOn = MapLibrary.shared.activeBLEEnabled
@@ -584,7 +585,16 @@ final class SurveyEngine: ObservableObject {
             let wm = WorldMapKeeper.loadActive()
             try ar.start(dir: dir, wantsDepth: true, lateralFile: dir.appendingPathComponent("depth_lateral.csv"),
                          wantsMesh: scanMesh, worldMap: wm)
-            if wm != nil { AppLog.i("建图", "已载入视觉特征地图：对着房间慢慢转一圈，认出房间会自动定好起点和朝向") }
+            relocalizedThisRun = false
+            if wm != nil {
+                AppLog.i("建图", "已载入视觉特征地图：对着房间慢慢转一圈，认出房间会自动定好起点和朝向")
+                // 15 秒还没认出房间（多半不是这个房间）：丢掉特征地图按普通模式跟踪，不然 ARKit 一直等、走路不动
+                let run = sessionName
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 15_000_000_000)
+                    self?.giveUpWorldMapIfNeeded(run: run)
+                }
+            }
             arFloorY = nil
             arAlignment = nil
         } catch {
@@ -701,8 +711,25 @@ final class SurveyEngine: ObservableObject {
 
     // MARK: 视觉重定位（房间）
 
+    private var relocalizedThisRun = false
+    @Published private(set) var worldMapGivenUp = false
+
+    private func giveUpWorldMapIfNeeded(run: String?) {
+        guard stage != .idle, sessionName == run, !relocalizedThisRun, stage != .tracking else { return }
+        ar.dropWorldMap()
+        worldMapGivenUp = true
+        // 等认房间时长按 / 设的朝向都基于还没稳定的坐标系，重来
+        position = nil
+        trail = []
+        latestA = nil
+        stage = .needPosition
+        lastError = "15 秒没认出房间（当前地图「\(MapLibrary.shared.active?.name ?? "")」可能不是你所在的房间），已改成普通模式：长按地图定起点。不对的话先在地图库切换到正确的地图。"
+        AppLog.w("建图", "15 秒没认出房间，丢掉视觉特征地图、普通模式跟踪")
+    }
+
     /// 载入特征地图后 ARKit 认出了房间：此刻起 AR 坐标系就是房间扫描时的，用地图里的 arAlign 精确定位和定朝向。
     private func handleRelocalized(_ cam: simd_float4x4) {
+        relocalizedThisRun = true
         guard stage != .idle, let t = StoreDataStore.shared.map?.arAlign else { return }
         let a = Point2(Double(cam.columns.3.x) * 100, Double(cam.columns.3.z) * 100)
         let p = t.toMap(a)
