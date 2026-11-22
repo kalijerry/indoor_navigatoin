@@ -15,7 +15,8 @@ final class RoomGraphTests: XCTestCase {
 
     /// 房间扫描风格：单元之间留 10 cm 墙缝，墙是 MapWall（10 cm 厚），门 14 cm 厚。imdf = true 时是 IMDF 风格：
     /// 单元贴着（没有墙缝）、没有墙、门是 MapOpening，并且不写 units（只有 floorPolygons）。
-    static func officeJSON(imdf: Bool = false) -> Data {
+    /// abWall = false：A、B 之间那面墙没扫到（开放式办公区被切成两个单元），abWallGapCm > 0：墙在中间留一道这么宽的缝。
+    static func officeJSON(imdf: Bool = false, abWall: Bool = true, abWallGapCm: Double = 0) -> Data {
         let gap = imdf ? 0.0 : 5.0
         func rect(_ x0: Double, _ y0: Double, _ x1: Double, _ y1: Double) -> [Double] { [x0, y0, x1, y0, x1, y1, x0, y1] }
         let a = rect(100, 100, 505 - gap, 405 - gap)
@@ -29,7 +30,13 @@ final class RoomGraphTests: XCTestCase {
             wall(505, 100, 820, 0)          // 北外墙
             wall(505, 405, 820, 0)          // 房间 / 走廊之间（门嵌在这面墙里）
             wall(505, 565, 820, 0)          // 南外墙
-            wall(505, 250, 310, 90)         // A、B 之间
+            if abWall && abWallGapCm <= 0 {
+                wall(505, 250, 310, 90)     // A、B 之间
+            } else if abWall {              // 中间留缝：上下两段
+                let half = (310 - abWallGapCm) / 2
+                wall(505, 95 + half / 2, half, 90)
+                wall(505, 405 - half / 2, half, 90)
+            }
             wall(95, 330, 470, 90)          // 西外墙
             wall(915, 330, 470, 90)         // 东外墙
             // 一张桌子（Konva 左上角）：A 里 (150…250, 150…200)
@@ -49,7 +56,9 @@ final class RoomGraphTests: XCTestCase {
         return try! JSONSerialization.data(withJSONObject: root)
     }
 
-    static func office(imdf: Bool = false) throws -> StoreMap { try StoreDataLoader.loadMap(officeJSON(imdf: imdf)) }
+    static func office(imdf: Bool = false, abWall: Bool = true, abWallGapCm: Double = 0) throws -> StoreMap {
+        try StoreDataLoader.loadMap(officeJSON(imdf: imdf, abWall: abWall, abWallGapCm: abWallGapCm))
+    }
 
     /// 没有任何磁场数据的场（只测运动约束）
     static func emptyField(_ m: StoreMap) -> MagneticFieldMap {
@@ -128,6 +137,35 @@ final class RoomGraphTests: XCTestCase {
         XCTAssertTrue(w.isSegmentClear(from: Point2(300, 330), to: Point2(300, 480)))
         XCTAssertFalse(w.isSegmentClear(from: Point2(150, 330), to: Point2(150, 480)))
         XCTAssertFalse(w.isSegmentClear(from: Point2(450, 250), to: Point2(560, 250)))
+    }
+
+    /// 房间扫描把一片开放空间切成两个单元、分界上没有墙：分界当隐形门，A ↔ B 直接走过去不算穿墙。
+    /// 2026-11 办公室 R3 / R4 就是这样，旧规则把跟着人的粒子全挡掉。
+    func testOpenSeamWithoutWallConnectsRooms() throws {
+        let g = try XCTUnwrap(RoomGraph(map: try Self.office(abWall: false)))
+        XCTAssertEqual(g.openSeams, 1)
+        XCTAssertEqual(g.doors.count, 2)
+        XCTAssertEqual(g.doorRooms.count, 3)
+        XCTAssertEqual(g.doorRooms[2], [0, 1])
+        XCTAssertFalse(g.crossesWithoutDoor(from: Point2(450, 250), to: Point2(560, 250)))   // A → B：没墙，能过
+        XCTAssertTrue(g.crossesWithoutDoor(from: Point2(150, 330), to: Point2(150, 480)))    // 有墙的地方照样挡
+        XCTAssertEqual(g.neighbours(ofRoom: 0), [1, 2])
+        // 关掉开关 = 原来的规则
+        var cfg = RoomGraph.Config()
+        cfg.openSeams = false
+        let old = try XCTUnwrap(RoomGraph(map: try Self.office(abWall: false), config: cfg))
+        XCTAssertEqual(old.openSeams, 0)
+        XCTAssertTrue(old.crossesWithoutDoor(from: Point2(450, 250), to: Point2(560, 250)))
+    }
+
+    /// 墙上一道比 minOpenSeamCm 窄的缝（墙段没对齐）不当门；够宽的缝当门
+    func testShortWallGapIsNotAnOpening() throws {
+        let narrow = try XCTUnwrap(RoomGraph(map: try Self.office(abWallGapCm: 30)))
+        XCTAssertEqual(narrow.openSeams, 0)
+        XCTAssertTrue(narrow.crossesWithoutDoor(from: Point2(450, 250), to: Point2(560, 250)))
+        let wide = try XCTUnwrap(RoomGraph(map: try Self.office(abWallGapCm: 150)))
+        XCTAssertEqual(wide.openSeams, 1)
+        XCTAssertFalse(wide.crossesWithoutDoor(from: Point2(450, 250), to: Point2(560, 250)))
     }
 
     /// IMDF 风格的地图：单元贴着、没有墙，可走区域本身挡不住，只有房间规则挡。

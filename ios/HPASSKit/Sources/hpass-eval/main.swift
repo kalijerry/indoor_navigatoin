@@ -106,7 +106,7 @@ do {
     // --rooms：办公室地图（有单元 / 门 / 墙）用房间约束（不经门不能换房间）并在估计里带房间，见 RoomGraph
     let useRooms = CommandLine.arguments.contains("--rooms")
     let walk = SessionEvaluator.walkable(map, rooms: useRooms)
-    if useRooms { print(walk?.rooms.map { "房间约束：\($0.rooms.count) 个单元、\($0.doors.count) 扇门" } ?? "房间约束：地图没有单元，不用") }
+    if useRooms { print(walk?.rooms.map { "房间约束：\($0.rooms.count) 个单元、\($0.doors.count) 扇门、\($0.openSeams) 段没墙的分界" } ?? "房间约束：地图没有单元，不用") }
     var out: [EvalReport] = []
     // 粒子滤波有随机性（加上字典遍历顺序每次不同），单次结果波动很大：--runs N 跑 N 次（不同随机种子），报中位和范围
     let runs = max(Int(arg("--runs") ?? "1") ?? 1, 1)

@@ -23,6 +23,10 @@ public final class RoomGraph {
         public var doorDepthCm: Double = 80
         /// 门洞沿墙方向每边收窄（cm，门框）
         public var doorInsetCm: Double = 0
+        /// 有墙的地图里，没有墙的房间分界当隐形门（见 init 第 7 步）
+        public var openSeams = true
+        /// 隐形门最短多长（cm）：比这短的缝当成墙角没对齐
+        public var minOpenSeamCm: Double = 60
         public init() {}
     }
 
@@ -123,7 +127,64 @@ public final class RoomGraph {
             dr.append(s.sorted())
         }
         doorRooms = dr
+        // 7. 没有墙的房间分界（开放式办公区）：房间扫描把一片开放空间切成了两个单元，分界上却没有墙也没有门。
+        //    有墙的地图（房间扫描）里，能不能过去由墙说了算：分界上两侧都能走的格子连成一段（≥ minOpenSeamCm）就当一扇
+        //    隐形的门。IMDF 地图没有墙、单元直接贴着，那里仍然只能经门换房间（不加隐形门）。
+        //    2026-11 办公室：R3 / R4 分界没有墙，人每天从那里走过，旧规则把跟着人的粒子全挡掉了（留一法回放误差 1.2 m → 4 m）。
+        if config.openSeams && !walls.isEmpty {
+            var seam = [Int32](repeating: -1, count: n)          // 分界格所属的房间对（下标进 pairs）
+            var pairs: [[Int]] = []
+            func pairId(_ a: Int, _ b: Int) -> Int32 {
+                let p = [min(a, b), max(a, b)]
+                if let i = pairs.firstIndex(of: p) { return Int32(i) }
+                pairs.append(p)
+                return Int32(pairs.count - 1)
+            }
+            for j in 0..<rows {
+                for i in 0..<cols {
+                    let k = j * cols + i
+                    guard open[k], label[k] >= 0, door[k] < 0 else { continue }
+                    for (di, dj) in [(1, 0), (0, 1)] {
+                        let i2 = i + di, j2 = j + dj
+                        guard i2 < cols, j2 < rows else { continue }
+                        let k2 = j2 * cols + i2
+                        guard open[k2], label[k2] >= 0, label[k2] != label[k], door[k2] < 0 else { continue }
+                        let pid = pairId(Int(label[k]), Int(label[k2]))
+                        seam[k] = pid
+                        seam[k2] = pid
+                    }
+                }
+            }
+            // 同一房间对的分界格按 8 邻接连成段，够长的一段 = 一扇隐形门
+            let minCells = max(Int((config.minOpenSeamCm / cellCm).rounded(.up)), 1)
+            var visited = [Bool](repeating: false, count: n)
+            for k0 in 0..<n where seam[k0] >= 0 && !visited[k0] {
+                var comp = [k0], q = [k0]
+                visited[k0] = true
+                while let k = q.popLast() {
+                    let i = k % cols, j = k / cols
+                    for dj in -1...1 {
+                        for di in -1...1 {
+                            let i2 = i + di, j2 = j + dj
+                            guard i2 >= 0, i2 < cols, j2 >= 0, j2 < rows else { continue }
+                            let k2 = j2 * cols + i2
+                            if !visited[k2], seam[k2] == seam[k0] { visited[k2] = true; comp.append(k2); q.append(k2) }
+                        }
+                    }
+                }
+                // 段长：分界两侧各一排格子，按格数的一半算
+                guard (comp.count + 1) / 2 >= minCells else { continue }
+                let id = Int32(dr.count)
+                dr.append(pairs[Int(seam[k0])])
+                for k in comp { door[k] = id }
+                openSeams += 1
+            }
+            doorRooms = dr
+        }
     }
+
+    /// 第 7 步加的隐形门（没有墙的房间分界）有几段；它们在 `doorRooms` 里排在真门后面（下标 ≥ `doors.count`）
+    public private(set) var openSeams = 0
 
     /// 从地图建：单元用 `roomUnits`，门 = MapDoor + MapOpening，墙 = MapWall，家具 = 实体货架（房间扫描的家具）。
     /// 没有任何单元时返回 nil（场地通道地图不用房间约束）。

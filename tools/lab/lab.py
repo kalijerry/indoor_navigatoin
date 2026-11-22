@@ -17,6 +17,8 @@
   walk-once     每个建图会话单独建图（= 只走一遍），测试会话只用「不是同一天」的；Oriient「走一遍就能用」的对标指标
   all-builds    全部建图会话融合后测试
   track         全部建图会话融合 → 已知起点跟踪
+  leave-one-out 留一法：一个地图有 ≥ 3 次能用的建图会话时，每次拿掉一个，用其余的建图，再用拿掉那次的真实 IMU + 磁力计
+                （--motion pdr-imu）回放，参考轨迹 = 它自己的锚点 + ARKit 对齐。不用专门去走测试，小场地（办公室）也有分数
   office-carry  盲测机（摄像头关，按被测携带方式带）+ 真值伴随机（ARKit），敲击对时（bump_sync.py），真实 IMU 回放
                 （--motion pdr-imu），冷启动和已知起点各一次；办公室指标（office_metrics.py）按携带方式 / 地图年龄聚合
 站点在报告里只用代号：设置了 HPASS_LAB_SALT 时 = HMAC-SHA256(盐, map_id) 前 6 位（仓库公开，没有盐就猜不出），
@@ -230,18 +232,24 @@ def convert_key(conv: Path, args: list[str]) -> str:
     return h.hexdigest()[:16]
 
 
-def prepare_public(suite: dict, ilc_floor: Path, work: Path, conv: Path | None = None, run=subprocess.run):
+def prepare_public(suite: dict, ilc_floor: Path, work: Path, conv: Path | None = None, run=subprocess.run,
+                   sim_conv: Path | None = None):
+    """公开数据：ilc = 微软商场数据（MIT）转换；sim = tools/bench/sim_small.py 合成的小场地（不用任何外部数据）"""
     conv = conv or ROOT / "tools" / "bench" / "ilc_convert.py"
+    sim_conv = sim_conv or ROOT / "tools" / "bench" / "sim_small.py"
     for name, ds in suite["datasets"].items():
-        if ds.get("kind") != "ilc":
+        if ds.get("kind") not in ("ilc", "sim"):
             continue
         dst = work / "public" / name
         args = ["--drift", ds["drift"]]
+        if ds.get("kind") == "sim":
+            args += ["--layout", ds["layout"], "--seed", str(ds.get("seed", 1))]
         if ds.get("build_max"):
             args += ["--build-max", str(ds["build_max"])]
         if ds.get("flip_y"):
             args += ["--flip-y"]
-        key = convert_key(conv, args)
+        script = sim_conv if ds.get("kind") == "sim" else conv
+        key = convert_key(script, args)
         key_file = dst / CONVERT_KEY_FILE
         if (dst / "manifest.json").exists():
             old = key_file.read_text().strip() if key_file.exists() else ""
@@ -251,7 +259,8 @@ def prepare_public(suite: dict, ilc_floor: Path, work: Path, conv: Path | None =
             print(f"[lab] {name} 的转换脚本或参数变了（{old or '无记录'} → {key}），重新转换")
         if dst.exists():
             shutil.rmtree(dst)
-        cmd = [sys.executable, str(conv), str(ilc_floor), str(dst)] + args
+        cmd = ([sys.executable, str(script), str(dst)] if ds.get("kind") == "sim"
+               else [sys.executable, str(conv), str(ilc_floor), str(dst)]) + args
         print("[lab] " + " ".join(cmd[1:]))
         run(cmd, check=True)
         dst.mkdir(parents=True, exist_ok=True)
@@ -293,6 +302,9 @@ def group_sessions(dirs: list[Path]) -> dict[str, dict]:
     return groups
 
 
+LOO_MIN_BUILDS = 3
+
+
 def prepare_site(mid: str, g: dict, work: Path, map_json: bytes) -> dict | None:
     """一个地图的会话 → <work>/private/<代号>/{map.json, build/, test/, office/}，返回清单条目（没有可用测试就 None）"""
     import office_carry
@@ -310,7 +322,8 @@ def prepare_site(mid: str, g: dict, work: Path, map_json: bytes) -> dict | None:
                 office.append({k: info[k] for k in ("name", "carry_mode", "map_age_days", "start_heading")})
             else:
                 rejected.append({"name": b.name, "reason": info["reason"]})
-    if not g["build"] or not (g["test"] or office):
+    loo = len(g["build"]) >= LOO_MIN_BUILDS
+    if not g["build"] or not (g["test"] or office or loo):
         return None
     for kind in ("build", "test"):
         (dst / kind).mkdir(parents=True, exist_ok=True)
@@ -320,13 +333,58 @@ def prepare_site(mid: str, g: dict, work: Path, map_json: bytes) -> dict | None:
                 shutil.copytree(d, tgt)
     (dst / "map.json").write_bytes(map_json)
     entry = {"label": label, "build": sorted(d.name for d, _ in g["build"]), "test": sorted(d.name for d, _ in g["test"])}
+    if loo:
+        entry["loo"] = True
     if office or rejected:
         entry["office"] = sorted(office, key=lambda o: o["name"])
         entry["office_rejected"] = rejected
-    print(f"[lab] {label}：建图 {len(g['build'])}，测试 {len(g['test'])}，盲测 {len(office)}（不用 {len(rejected)}）")
+    print(f"[lab] {label}：建图 {len(g['build'])}，测试 {len(g['test'])}，盲测 {len(office)}（不用 {len(rejected)}）"
+          + ("，留一法" if loo else ""))
     for r in rejected:
         print(f"[lab]   盲测不用：{r['reason']}")
     return entry
+
+
+def backend_exclude(url, token) -> set[str]:
+    """后台的排除名单（/api/config/exclude，云端建图也按它排除，比如带磁吸配件采的那几次）；拿不到就空"""
+    try:
+        return {str(n) for n in json.loads(_req(url, token, "/api/config/exclude"))}
+    except Exception as e:  # noqa: BLE001
+        print(f"[lab] 拿不到排除名单（{e}），不排除")
+        return set()
+
+
+def session_excluded(name: str, exclude: set[str]) -> bool:
+    """name = 后台的 zip 名（ios_survey_x.zip / mag_x_files.zip）；排除名单里写不写 .zip 都认"""
+    base = name[:-4] if name.endswith(".zip") else name
+    return name in exclude or base in exclude
+
+
+def usable_dirs(dirs: list[Path]) -> list[Path]:
+    """App 采集时质量打分判为整个不能用的会话不要（和云端建图同一个规则，cloud_build_lib.quality_rejected）"""
+    sys.path.insert(0, str(ROOT / "tools"))
+    from cloud_build_lib import quality_rejected
+    out = []
+    for d in dirs:
+        why = quality_rejected(str(d))
+        if why:
+            print(f"[lab] 不用 {d.name}：采集质量不合格（{why}）")
+            continue
+        out.append(d)
+    return out
+
+
+def loo_folds(builds: list[str]) -> list[tuple[list[str], str]]:
+    """留一法：[(其余建图会话, 拿掉的那次)]"""
+    return [([b for b in builds if b != t], t) for t in builds]
+
+
+def loo_runs(eval_cmd, d: Path, site: dict, runs: int, flags: list[str]):
+    """留一法：每折一次 hpass-eval（建图 = 其余，测试 = 拿掉的那次），报告合并；逐点轨迹合并后算办公室指标"""
+    reps, track = [], {}
+    for others, held in loo_folds(site["build"]):
+        reps += run_eval(eval_cmd, d, ",".join("build/" + b for b in others), "build/" + held, runs, flags, track=track)
+    return reps, track_office(track, d)
 
 
 def prepare_private(work: Path) -> list[dict]:
@@ -341,12 +399,16 @@ def prepare_private(work: Path) -> list[dict]:
         url = "https://" + url
     raw = work / "private-raw"
     raw.mkdir(parents=True, exist_ok=True)
+    exclude = backend_exclude(url, token)
     dirs = []
     for o in json.loads(_req(url, token, "/api/sessions")):
         name = o["key"].split("/", 1)[1]
+        if session_excluded(name, exclude):
+            continue
         z = zipfile.ZipFile(io.BytesIO(_req(url, token, "/api/sessions/" + urllib.parse.quote(name))))
         z.extractall(raw)
         dirs += [raw / os.path.dirname(m) for m in z.namelist() if m.endswith("meta.json") and m.count("/") == 1]
+    dirs = usable_dirs(dirs)
     manifest = []
     for mid, g in sorted(group_sessions(dirs).items()):
         if not g["build"]:
@@ -468,6 +530,16 @@ def run_suite(suite: dict, tier: str, work: Path, eval_cmd: list[str], only: str
                         record(f"{sid}/{sub}", f"{pcfg['title']}（{'已知起点' if oracle else '冷启动'}）", priv.get("gate", False),
                                lambda d=d, site=site, fl=fl, oracle=oracle: office_runs(eval_cmd, d, site, runs, fl, oracle),
                                {"office_sessions": len(site["office"])})
+                    continue
+                if proto == "leave-one-out":
+                    if not site.get("loo"):
+                        continue
+                    for sub, fl in (("track", pcfg["flags"] + pcfg.get("track_flags", [])),
+                                    ("cold", pcfg["flags"] + pcfg.get("cold_flags", []))):
+                        record(f"{sid}/{sub}", f"{pcfg['title']}（{'已知起点' if sub == 'track' else '冷启动'}）",
+                               pcfg.get("gate", priv.get("gate", False)),
+                               lambda d=d, site=site, fl=fl: loo_runs(eval_cmd, d, site, runs, fl),
+                               {"loo_folds": len(site["build"])})
                     continue
                 if not site.get("test"):
                     continue
