@@ -18,7 +18,10 @@
   all-builds    全部建图会话融合后测试
   track         全部建图会话融合 → 已知起点跟踪
   leave-one-out 留一法：一个地图有 ≥ 3 次能用的建图会话时，每次拿掉一个，用其余的建图，再用拿掉那次的真实 IMU + 磁力计
-                （--motion pdr-imu）回放，参考轨迹 = 它自己的锚点 + ARKit 对齐。不用专门去走测试，小场地（办公室）也有分数
+                （--motion pdr-imu）回放，参考轨迹 = 它自己的锚点 + ARKit 对齐。不用专门去走测试，小场地（办公室）也有分数。
+                协议里有 chain_flags 时多一个 track-k：各折按会话开始时间排序依次跑，带着前面学到的步长 K
+                （hpass-eval --carry-k --k-state，App 的 StepScaleStore 行为；--vio-k = 前面的会话若开着摄像头增强定位、用视觉里程计标定过 K；
+                App 测绘时不学 K）
   office-carry  盲测机（摄像头关，按被测携带方式带）+ 真值伴随机（ARKit），敲击对时（bump_sync.py），真实 IMU 回放
                 （--motion pdr-imu），冷启动和已知起点各一次；办公室指标（office_metrics.py）按携带方式 / 地图年龄聚合
 站点在报告里只用代号：设置了 HPASS_LAB_SALT 时 = HMAC-SHA256(盐, map_id) 前 6 位（仓库公开，没有盐就猜不出），
@@ -90,6 +93,30 @@ def metrics(reports: list[dict]) -> dict:
     for k in ("wrong_fix", "within2m", "coverage", "fixed_share"):
         if out[k] is not None:
             out[k] = round(out[k], 4)
+    out.update(robustness(reports))
+    return out
+
+
+def robustness(reports: list[dict]) -> dict:
+    """不确定度标定 + 跳点（hpass-eval 报告里有 uncertaintiesCm / estPathCm / refPathFixCm / bigJumps 时才有，老报告全是 None）。
+    报的 1σ（MagneticEstimate.uncertaintyCm）是均方根半径 √(σx² + σy²)：误差服从二维各向同性高斯时，
+    误差 / 1σ 的中位 = √(ln 2) ≈ 0.83、落在 1σ 内 1 − e⁻¹ ≈ 63%、2σ 内 1 − e⁻⁴ ≈ 98%（目标）。
+    - unc_ratio_p50：误差 / 报的 1σ 的中位（> 0.83 = 报得太自信）；within_1sigma / within_2sigma：落在 1σ / 2σ 以内的比例；
+    - path_ratio：相邻有把握打分点之间估计走过的路 / 参考走过的路（1 = 不抖；来回跳会变大）；
+    - jumps3m_per_100m：相邻有把握打分点之间估计挪 > 3 m 的次数，每 100 m 参考路程。"""
+    ratios = sorted(e / u for r in reports
+                    for e, u in zip(r.get("errorsCm") or [], r.get("uncertaintiesCm") or []) if u and u > 0)
+    est = sum(r.get("estPathCm") or 0 for r in reports)
+    ref = sum(r.get("refPathFixCm") or 0 for r in reports)
+    has_path = any("refPathFixCm" in r for r in reports)
+    out = {
+        "unc_ratio_p50": round(pct(ratios, 0.5), 3) if ratios else None,
+        "within_1sigma": round(sum(x <= 1 for x in ratios) / len(ratios), 4) if ratios else None,
+        "within_2sigma": round(sum(x <= 2 for x in ratios) / len(ratios), 4) if ratios else None,
+        "path_ratio": round(est / ref, 3) if has_path and ref > 0 else None,
+        "jumps3m_per_100m": (round(sum(r.get("bigJumps") or 0 for r in reports) / (ref / 1e4), 3)
+                             if has_path and ref > 0 else None),
+    }
     return out
 
 
@@ -379,11 +406,33 @@ def loo_folds(builds: list[str]) -> list[tuple[list[str], str]]:
     return [([b for b in builds if b != t], t) for t in builds]
 
 
-def loo_runs(eval_cmd, d: Path, site: dict, runs: int, flags: list[str]):
-    """留一法：每折一次 hpass-eval（建图 = 其余，测试 = 拿掉的那次），报告合并；逐点轨迹合并后算办公室指标"""
+def session_start_ms(d: Path) -> int:
+    """会话开始时刻 = imu.csv 第一个样本的 t_ms；读不到就 0（按名字排）"""
+    try:
+        with open(d / "imu.csv", encoding="utf-8") as f:
+            f.readline()
+            return int(f.readline().split(",", 1)[0])
+    except (OSError, ValueError):
+        return 0
+
+
+def chronological(d: Path, names: list[str]) -> list[str]:
+    """建图会话按开始时间排序（同时刻按名字）"""
+    return sorted(names, key=lambda n: (session_start_ms(d / "build" / n), n))
+
+
+def loo_runs(eval_cmd, d: Path, site: dict, runs: int, flags: list[str], chain: bool = False):
+    """留一法：每折一次 hpass-eval（建图 = 其余，测试 = 拿掉的那次），报告合并；逐点轨迹合并后算办公室指标。
+    chain：各折按开始时间排序依次跑，K 的状态文件（--k-state）在折之间传下去（flags 里应带 --carry-k）"""
     reps, track = [], {}
-    for others, held in loo_folds(site["build"]):
-        reps += run_eval(eval_cmd, d, ",".join("build/" + b for b in others), "build/" + held, runs, flags, track=track)
+    folds = loo_folds(site["build"])
+    with tempfile.TemporaryDirectory() as td:
+        if chain:
+            order = {n: i for i, n in enumerate(chronological(d, site["build"]))}
+            folds.sort(key=lambda f: order[f[1]])
+        for others, held in folds:
+            fl = list(flags) + (["--k-state", str(Path(td) / "k.json")] if chain else [])
+            reps += run_eval(eval_cmd, d, ",".join("build/" + b for b in others), "build/" + held, runs, fl, track=track)
     return reps, track_office(track, d)
 
 
@@ -534,11 +583,15 @@ def run_suite(suite: dict, tier: str, work: Path, eval_cmd: list[str], only: str
                 if proto == "leave-one-out":
                     if not site.get("loo"):
                         continue
-                    for sub, fl in (("track", pcfg["flags"] + pcfg.get("track_flags", [])),
-                                    ("cold", pcfg["flags"] + pcfg.get("cold_flags", []))):
-                        record(f"{sid}/{sub}", f"{pcfg['title']}（{'已知起点' if sub == 'track' else '冷启动'}）",
+                    subs = [("track", pcfg["flags"] + pcfg.get("track_flags", []), False, "已知起点"),
+                            ("cold", pcfg["flags"] + pcfg.get("cold_flags", []), False, "冷启动")]
+                    if pcfg.get("chain_flags"):
+                        subs.append(("track-k", pcfg["flags"] + pcfg.get("track_flags", []) + pcfg["chain_flags"], True,
+                                     "已知起点，按时间顺序带着之前学到的步长 K"))
+                    for sub, fl, chain, what in subs:
+                        record(f"{sid}/{sub}", f"{pcfg['title']}（{what}）",
                                pcfg.get("gate", priv.get("gate", False)),
-                               lambda d=d, site=site, fl=fl: loo_runs(eval_cmd, d, site, runs, fl),
+                               lambda d=d, site=site, fl=fl, chain=chain: loo_runs(eval_cmd, d, site, runs, fl, chain=chain),
                                {"loo_folds": len(site["build"])})
                     continue
                 if not site.get("test"):
@@ -652,6 +705,12 @@ def build_report(res: dict, baseline: dict | None, suite: dict) -> tuple[str, bo
         md += ["**办公室指标**（office_metrics.py，1 Hz 网格；房间类指标只有带房间单元的地图才有）", "",
                "| 场景 | 房间判对（有定位 / 全部时间） | 错房间 相邻 / 远 | 过门延迟 P50 / P90 · 漏 | ≤1 m（点 / 时间） | P50 / P90 | 覆盖 | TTFF 时间 / 路程 · 定到率 | 档位 |",
                "|---|---|---|---|---|---|---|---|---|", *office_rows, ""]
+    rob_rows = [robust_row(r, base_map.get(r["id"])) for r in res["results"]
+                if (r.get("metrics") or {}).get("unc_ratio_p50") is not None or (r.get("metrics") or {}).get("path_ratio") is not None]
+    if rob_rows:
+        md += ["**不确定度标定与跳点**（只显示、不拦；括号里是基线。报的 1σ 诚实时：误差/1σ 中位 ≈ 0.83、1σ 内 ≈ 63%、2σ 内 ≈ 98%）", "",
+               "| 场景 | 误差 / 1σ 中位 | 1σ 内 | 2σ 内 | 轨迹长度比 | 跳 > 3 m（次 / 100 m） |",
+               "|---|---|---|---|---|---|", *rob_rows, ""]
     if notes:
         md += ["**失败详情**", *notes, ""]
     lad = "；".join(f"{lv['name']}：中位 ≤ {lv['median_cm'] / 100:g} m、P90 ≤ {lv['p90_cm'] / 100:g} m、错定 ≤ {lv['wrong_fix'] * 100:g}%、"
@@ -665,6 +724,18 @@ def build_report(res: dict, baseline: dict | None, suite: dict) -> tuple[str, bo
            "- 退步判定：中位、P90 变差超过 15% + 0.3 / 0.6 m，错定率多 5 个点，覆盖少 7 个点，定到率少 10 个点。",
            "", "</details>"]
     return "\n".join(md), regressed
+
+
+def robust_row(r: dict, base: dict | None) -> str:
+    """不确定度标定 / 跳点一行（见 robustness）；有基线时括号里写基线值"""
+    m, b = r["metrics"], base or {}
+
+    def cell(k, pc=False):
+        def f(v):
+            return "—" if v is None else (f"{v * 100:.0f}%" if pc else f"{v:.2f}")
+        return f(m.get(k)) + (f"（{f(b.get(k))}）" if b.get(k) is not None else "")
+    return (f"| `{r['id']}` | {cell('unc_ratio_p50')} | {cell('within_1sigma', True)} | {cell('within_2sigma', True)} | "
+            f"{cell('path_ratio')} | {cell('jumps3m_per_100m')} |")
 
 
 def office_level(o: dict, ladder: list[dict]) -> str | None:

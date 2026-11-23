@@ -35,6 +35,28 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(m["coverage"], 0)
         self.assertEqual(m["fixed_share"], 0)
 
+    def test_robustness_metrics(self):
+        r = rep([50, 100, 300, 900], ref=4)
+        r.update({"uncertaintiesCm": [100, 100, 100, -1], "estPathCm": 600.0, "refPathFixCm": 400.0, "bigJumps": 1})
+        m = lab.metrics([r])
+        # 误差 / 1σ：0.5、1、3（第四个点没报不确定度，不算）
+        self.assertEqual(m["unc_ratio_p50"], 1.0)
+        self.assertAlmostEqual(m["within_1sigma"], 2 / 3, places=3)
+        self.assertAlmostEqual(m["within_2sigma"], 2 / 3, places=3)
+        self.assertEqual(m["path_ratio"], 1.5)
+        self.assertEqual(m["jumps3m_per_100m"], 25.0)     # 1 次 / 4 m 参考路程
+
+    def test_robustness_absent_in_old_reports(self):
+        m = lab.metrics([rep([100, 200])])
+        for k in ("unc_ratio_p50", "within_1sigma", "within_2sigma", "path_ratio", "jumps3m_per_100m"):
+            self.assertIsNone(m[k])
+
+    def test_robustness_is_not_a_gate(self):
+        base = {"median_cm": 300, "p90_cm": 800, "wrong_fix": 0.2, "coverage": 0.8, "fixed_share": 1.0,
+                "unc_ratio_p50": 0.8, "path_ratio": 1.1}
+        c = lab.compare(dict(base, unc_ratio_p50=3.0, path_ratio=2.5), base, SUITE["tolerance"])
+        self.assertFalse(c["regressions"])
+
     def test_ladder(self):
         ladder = SUITE["ladder"]
         self.assertEqual(lab.ladder_level({"median_cm": 120, "p90_cm": 250, "wrong_fix": 0.02, "coverage": 0.9}, ladder),
@@ -288,6 +310,39 @@ class SimAndLooTests(unittest.TestCase):
             self.assertFalse(r["gate"])
             self.assertEqual(r["metrics"]["replays"], 3)         # 3 折 × 1 次
             self.assertEqual(r["loo_folds"], 3)
+
+
+    def test_loo_chain_runs_folds_chronologically_with_k_state(self):
+        tmp = Path(tempfile.mkdtemp())
+        work = tmp / "work"
+        d = work / "private" / "site-x"
+        for name, t0 in (("a", 3000), ("b", 1000), ("c", 2000)):     # 开始时间：b < c < a
+            (d / "build" / name).mkdir(parents=True)
+            (d / "build" / name / "imu.csv").write_text(f"t_ms,ax\n{t0},0\n")
+        (d / "map.json").write_text("{}")
+        (work / "private" / "manifest.json").write_text(json.dumps([{"label": "site-x", "build": ["a", "b", "c"], "test": [], "loo": True}]))
+        log = tmp / "calls.jsonl"
+        fake = tmp / "fake_eval.py"
+        fake.write_text(FAKE_EVAL + textwrap.dedent(f"""
+            with open({str(log)!r}, "a") as f:
+                f.write(json.dumps(a[1:]) + "\\n")
+        """))
+        suite = {"runs": {"pr": 1}, "datasets": {}, "scenarios": [],
+                 "private": {"tiers": ["pr"], "gate": True, "protocols": {
+                     "leave-one-out": {"title": "loo", "flags": ["--motion", "pdr-imu"], "track_flags": ["--oracle-start"],
+                                       "cold_flags": [], "chain_flags": ["--carry-k"], "gate": False}}}}
+        res = lab.run_suite(suite, "pr", work, [sys.executable, str(fake)])
+        ids = [r["id"] for r in res["results"]]
+        self.assertEqual(ids, ["private/site-x/leave-one-out/track", "private/site-x/leave-one-out/cold",
+                               "private/site-x/leave-one-out/track-k"])
+        calls = [json.loads(x) for x in log.read_text().splitlines()]
+        chain = [c for c in calls if "--carry-k" in c]
+        self.assertEqual([c[c.index("--test") + 1] for c in chain], ["build/b", "build/c", "build/a"])
+        ks = {c[c.index("--k-state") + 1] for c in chain}
+        self.assertEqual(len(ks), 1)                             # 三折共用一个 K 状态文件
+        self.assertTrue(all("--k-state" not in c for c in calls if "--carry-k" not in c))
+        self.assertTrue(all("--oracle-start" in c for c in chain))
+        self.assertEqual(lab.chronological(d, ["a", "b", "c", "zz"]), ["zz", "b", "c", "a"])   # 读不到 imu.csv 的排最前
 
 
 FAKE_EVAL = textwrap.dedent("""

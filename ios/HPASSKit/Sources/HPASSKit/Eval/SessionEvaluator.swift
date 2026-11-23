@@ -24,8 +24,20 @@ public struct EvalReport: Codable {
     public var inMapShare: Double?
     /// 每个已定位点的误差（cm），汇总多个会话时用
     public var errorsCm: [Double] = []
+    /// `.pdrIMU` + 携带运动模型：回放结束时惯导引擎学到的分模式步长比例（App 存到本机、下次恢复的那份，见 StepScaleStore）
+    /// 和这次在线标定吸收了几次。hpass-eval --carry-k 按时间顺序把前一次的传给下一次
+    public var learnedStepScales: [String: Double]?
+    public var stepScaleAbsorbed: Int?
+    /// --carry-k：这次是同一个场地按时间顺序回放的第几个会话（0 = 第一次，还没有学到的 K）
+    public var sequenceIndex: Int?
     /// 参考轨迹上的点数（含没定到位的），算「定位覆盖率」
     public var refPoints: Int = 0
+    /// 和 errorsCm 一一对应：报的 1σ 不确定度（cm；−1 = 没报），量不确定度标定
+    public var uncertaintiesCm: [Double] = []
+    /// 相邻两个有把握的打分点之间估计 / 参考走过的路（cm）和估计跳 > 3 m 的次数（见 `LocalizationEvaluator`），量跳点 / 来回抖
+    public var estPathCm: Double = 0
+    public var refPathFixCm: Double = 0
+    public var bigJumps: Int = 0
 
     public var line: String {
         func f(_ v: Double?) -> String { v.map { String(format: "%.0f", $0) } ?? "—" }
@@ -127,6 +139,28 @@ public enum SessionEvaluator {
         }
     }
 
+    /// 跟踪似然的地图标定（`TrackingCalibration`）：建图会话按下标奇偶分两折，一折建图、另一折沿自己的参考轨迹
+    /// （有 truth.csv 用它，没有用自己的锚点对齐）每 50 cm 取一次读数和图比，两折合起来标定。hpass-build 出图时同一份。
+    /// 会话不到 2 个、标不出来（窗口太少 / 图上没有米级信息）时 nil。
+    /// 计算量：多建两次图 + 每个建图会话回放一遍特征流水线（不跑定位），离线做，手机上不算。
+    public static func trackingCalibration(sessions: [URL], map: StoreMap, mode: MapBuild = .fusion,
+                                           tagPositions: [String: Point2] = [:]) -> TrackingCalibration.Result? {
+        guard sessions.count >= 2 else { return nil }
+        let every = MagneticConfig().updateDistanceCm
+        var folds: [TrackingCalibration.Fold] = []
+        for k in 0..<2 {
+            let held = sessions.indices.filter { $0 % 2 == k }.map { sessions[$0] }
+            let rest = sessions.indices.filter { $0 % 2 != k }.map { sessions[$0] }
+            guard let f = try? buildMaps(sessions: rest, map: map, mode: mode, tagPositions: tagPositions).field else { continue }
+            let seqs = held.compactMap { u in
+                (try? residualSamples(dir: u, field: f, map: map, everyCm: every))?
+                    .map { TrackingCalibration.Sample(feature: $0.feature, reference: $0.reference) }
+            }
+            folds.append(.init(field: f, sequences: seqs))
+        }
+        return TrackingCalibration.calibrate(folds: folds)
+    }
+
     /// - Parameter rooms: 地图有单元（房间 / 走廊）时用房间约束版（墙挡住、门打通、带房间编号，见 `RoomGraph`）
     public static func walkable(_ map: StoreMap, rooms: Bool = false) -> WalkableMap? {
         if rooms, map.crosses.isEmpty, let w = WalkableMap(roomsOf: map) { return w }
@@ -193,12 +227,60 @@ public enum SessionEvaluator {
         public var carryMode: CarryMode = .unknown
         /// 这一刻是静止冻结状态
         public var frozen = false
+        /// 纯推算位置（`.pdrIMU`：惯导引擎的输出，已知起点时从真值起点、起步朝向出发；诊断用）
+        public var odometry: Point2? = nil
+        /// 滤波器报的置信度（诊断用）
+        public var confidence: Double? = nil
+        /// 诊断（`SessionEvaluator.trackDiagnostics` 打开时才算，每拍多扫一遍粒子）：全部粒子的位置散布（cm）、
+        /// 航向偏差的圆周标准差（度）、步长比例的加权中位数 / 标准差
+        public var spreadCm: Double? = nil
+        public var headingSpreadDeg: Double? = nil
+        public var scaleMedian: Double? = nil
+        public var scaleSigma: Double? = nil
+        /// 航向偏差的加权直方图（12 格，−180°…180°）
+        public var headingHistogram: [Double]? = nil
+        /// 全部粒子相对报的位置的加权 RMS 距离（cm）
+        public var spreadAroundEstimateCm: Double? = nil
+        /// 全部粒子的加权平均位置
+        public var particleMean: Point2? = nil
+        /// 惯导引擎当前生效的步长 K（`.pdrIMU`；诊断用）
+        public var stepK: Double? = nil
     }
+
+    /// 逐点轨迹里带上粒子散布等诊断量（hpass-eval --diag-out）。默认关：每拍要多扫一遍粒子
+    nonisolated(unsafe) public static var trackDiagnostics = false
 
     /// `.pdrIMU` 回放用的惯导引擎：App 实时定位页同一份配置（`FusionEngine.live`，罗盘关），**不带通道约束**
     /// （输出只当增量送粒子滤波，见 `FusionConfig.live`）。
-    static func replayFusion(start: Point2, headingRad: Double, carryMotion: Bool) -> FusionEngine {
-        FusionEngine.live(corridors: [], start: start, headingRad: headingRad, compass: false, carryMotion: carryMotion)
+    static func replayFusion(start: Point2, headingRad: Double, carryMotion: Bool, stepLengthScale: Double = 1) -> FusionEngine {
+        FusionEngine.live(corridors: [], start: start, headingRad: headingRad, compass: false, stepLengthScale: stepLengthScale,
+                          carryMotion: carryMotion)
+    }
+
+    /// 视觉里程计标定步长 K 的回放（hpass-eval --carry-k --vio-k）：一个有 ARKit 位姿的会话（测绘，或开着摄像头增强的定位）
+    /// 按 App 的接法跑一遍——惯导引擎（携带运动模型）从 `initial` 学到的 K 开始，每个 ARKit 位姿配上最新的惯导输出位置喂
+    /// `StepScaleCalibrator.observeVisualOdometry`——返回结束时的分姿态 K 和更新次数。不跑粒子滤波，不用地图。
+    public static func learnStepScalesFromVIO(dir: URL, initial: [CarryMode: Double]) throws
+        -> (scales: [CarryMode: Double], updates: Int, ratios: [Double]) {
+        let s = try SurveySessionLoader.load(dir, requireAnchors: false)
+        guard !s.poses.isEmpty else { return (initial, 0, []) }
+        let f = replayFusion(start: .zero, headingRad: 0, carryMotion: true)
+        if !initial.isEmpty { f.setLearnedStepScales(initial) }
+        let cal = StepScaleCalibrator()
+        var ratios: [Double] = []
+        var last: Point2?
+        var pi = 0
+        for x in s.imu {
+            // 这个 IMU 样本之前的 ARKit 位姿：配上当时最新的惯导位置
+            while pi < s.poses.count, s.poses[pi].tMs <= x.tMs {
+                let p = s.poses[pi]
+                if let q = last, cal.observeVisualOdometry(tMs: p.tMs, ar: p.a, trackingNormal: p.normal, pdr: q, engine: f) != nil,
+                   let r = cal.lastVIORatio { ratios.append(r) }
+                pi += 1
+            }
+            if let out = f.process(x) { last = out.position }
+        }
+        return (f.learnedStepScales, cal.vioUpdates, ratios)
     }
 
     /// 真值轨迹从起点走出 `minCm` 后的方向（弧度，0 = 地图 +y，dx = sin）；走不出这么远返回 nil
@@ -215,6 +297,8 @@ public enum SessionEvaluator {
                                 wifi: WiFiFingerprintMap? = nil, motion: MotionSource = .poses,
                                 startHeading: StartHeading = .truth,
                                 carryMotion: Bool = false, stationaryFreeze: Bool = false,
+                                stepLengthScale: Double = 1, learnedStepScales: [CarryMode: Double] = [:],
+                                scaleDiagnostics: Bool = false, posteriorStepScale: Bool = false,
                                 onTrack: ((TrackPoint) -> Void)? = nil) throws -> EvalReport {
         // 公开数据集基准 / 盲测会话：会话里有 truth.csv（t_ms,x_cm,y_cm）就直接当参考轨迹（位姿是合成的或根本没有，不能再对齐）；
         // 这时不需要 anchors.csv（盲测机不建图、没有锚点）
@@ -237,8 +321,11 @@ public enum SessionEvaluator {
             return t - ref[lo].tMs > 300 ? nil : ref[lo].p  // 参考点比查询时刻旧 300 ms 以上就不算
         }
         let pdr = motion == .pdrIMU
+        // 冷启动配置档按地图外框面积取（和 App 实时定位页一样：小场地的搜索更强，见 SmallMapColdStart）；
+        // 已知起点下面马上换成跟踪档，不传（不多撒一遍冷启动粒子，随机数序列和原来一样）
         let sh = ShadowLocalizer(field: field, walkable: walkable, useRawMag: !s.raw.isEmpty, configure: configure, seed: seed,
-                                coldStartGate: coldStartGate, visualOdometry: !pdr)
+                                coldStartGate: coldStartGate, visualOdometry: !pdr,
+                                mapAreaM2: oracleStart ? nil : map.width * map.height / 10_000)
         sh.bleMap = ble
         sh.crossCheckEnabled = crossCheck
         // 真实计步：惯导引擎和 App 实时定位页同一份配置（FusionEngine.live，罗盘关）。
@@ -252,19 +339,23 @@ public enum SessionEvaluator {
         var fusion: FusionEngine?
         var seedAt: (p: Point2, h: Double?)?
         let calibrator = StepScaleCalibrator()
+        calibrator.learnFromPosterior = posteriorStepScale
         var freezeDet = StationaryFreezeDetector()
         var reachedRef = false
         if pdr {
             if oracleStart, let r0 = ref.first {
                 let h = startHeading == .truth ? Self.truthHeading(ref) : nil
-                fusion = Self.replayFusion(start: r0.p, headingRad: h ?? 0, carryMotion: carryMotion)
+                fusion = Self.replayFusion(start: r0.p, headingRad: h ?? 0, carryMotion: carryMotion, stepLengthScale: stepLengthScale)
                 seedAt = (r0.p, h)
                 sh.localizer.config = oracleTrackingConfig(odometry: odometry, headingKnown: h != nil, configure: configure)
                 sh.localizer.reset(start: r0.p, spreadCm: TrackingProfile.startSpreadCm, headingUnknown: h == nil)
             } else {
-                fusion = Self.replayFusion(start: Point2(map.width / 2, map.height / 2), headingRad: 0, carryMotion: carryMotion)
+                fusion = Self.replayFusion(start: Point2(map.width / 2, map.height / 2), headingRad: 0, carryMotion: carryMotion,
+                                           stepLengthScale: stepLengthScale)
             }
             if carryMotion, let f = fusion {
+                // App 每次开始定位时恢复本机存的分模式 K（StepScaleStore → setLearnedStepScales）；评估默认空 = 第一次用
+                if !learnedStepScales.isEmpty { f.setLearnedStepScales(learnedStepScales) }
                 // 参考轨迹开始之前的事件不重撒（已知起点的先验是在第一个参考点给的），到第一个参考点时补告知当前模式
                 f.onCarryEvent = { ev in if reachedRef { _ = sh.localizer.apply(ev) } }
             }
@@ -315,12 +406,30 @@ public enum SessionEvaluator {
             if covered && est.converged { inMapErr.append(est.position.distance(to: r)) }
         }
         // 每个运动节拍（位姿 / 惯导输出）都写一行轨迹，滤波器这一拍没更新时用它最新的估计
-        func track(_ t: Int64) {
+        func track(_ t: Int64, odometry: Point2? = nil) {
             guard let cb = onTrack, let r = refAt(t) else { return }
             let e = sh.estimate
-            cb(TrackPoint(tMs: t, estimate: e?.position, converged: e?.converged ?? false,
-                          uncertaintyCm: e?.uncertaintyCm, reference: r, roomId: e?.roomId, roomMass: e?.roomMass ?? 0,
-                          carryMode: fusion?.carryMode ?? .unknown, frozen: sh.localizer.stationaryFrozen))
+            var tp = TrackPoint(tMs: t, estimate: e?.position, converged: e?.converged ?? false,
+                                uncertaintyCm: e?.uncertaintyCm, reference: r, roomId: e?.roomId, roomMass: e?.roomMass ?? 0,
+                                carryMode: fusion?.carryMode ?? .unknown, frozen: sh.localizer.stationaryFrozen, odometry: odometry)
+            tp.confidence = e?.confidence
+            if Self.trackDiagnostics {
+                let ws = sh.localizer.weightedSpread(), ss = sh.localizer.scaleStatistics()
+                tp.spreadCm = ws.spreadCm
+                tp.particleMean = ws.mean
+                tp.headingSpreadDeg = ws.headingSpreadDeg
+                tp.scaleMedian = ss.median
+                tp.scaleSigma = ss.sigma
+                tp.headingHistogram = sh.localizer.headingBiasHistogram(bins: 12)
+                if let p = e?.position { tp.spreadAroundEstimateCm = sh.localizer.weightedSpread(around: p) }
+            }
+            if scaleDiagnostics, odometry != nil {
+                let st = sh.localizer.scaleStatistics()
+                tp.scaleMedian = st.median
+                tp.scaleSigma = st.sigma
+                tp.stepK = fusion?.effectiveStepLengthK
+            }
+            cb(tp)
         }
         var lastFused: Point2?
         for (_, _, e) in evs {
@@ -341,7 +450,7 @@ public enum SessionEvaluator {
                         lastFused = out.position
                     }
                     if carryMotion { sh.localizer.setCarryMode(f.activeCarryMode, respread: false) }
-                    track(out.tMs)
+                    track(out.tMs, odometry: lastFused)
                     continue
                 }
                 let d = lastFused.map { out.position - $0 } ?? .zero
@@ -351,14 +460,15 @@ public enum SessionEvaluator {
                 }
                 if let est = sh.odometryStep(delta: d, tMs: out.tMs), let r = refAt(out.tMs) { score(est, r) }
                 if carryMotion { calibrator.step(deltaCm: d.length, engine: f, localizer: sh.localizer) }
-                track(out.tMs)
+                track(out.tMs, odometry: out.position)
             case .raw(let t, let v): sh.rawMag(tMs: t, v)
             case .ble(let b): sh.bleReading(tMs: b.tMs, id: b.id, rssi: b.rssi)
             case .wifi(let w): sh.wifiScan(w)
             case .pose(let p):
                 let pa = Point2(p.a.x * poseRot.c - p.a.y * poseRot.s, p.a.x * poseRot.s + p.a.y * poseRot.c)
                 if let est = sh.pose(a: pa, normal: p.normal, tMs: p.tMs), let r = refAt(p.tMs) { score(est, r) }
-                track(p.tMs)
+                // 位姿（只转了方向、没平移到地图）当「纯推算」给 --odo-out：诊断只用它的路程 / 位移比例
+                track(p.tMs, odometry: scaleDiagnostics ? pa : nil)
             }
         }
         var rep = EvalReport(session: dir.lastPathComponent, medianCm: ev.percentile(0.5), p90Cm: ev.percentile(0.9),
@@ -371,6 +481,14 @@ public enum SessionEvaluator {
                           inMapShare: refTotal > 0 ? Double(refInMap) / Double(refTotal) : nil)
         rep.errorsCm = ev.errors
         rep.refPoints = refTotal
+        rep.uncertaintiesCm = ev.uncertainties
+        rep.estPathCm = ev.estPathCm
+        rep.refPathFixCm = ev.refPathFixCm
+        rep.bigJumps = ev.bigJumps
+        if carryMotion, let f = fusion {
+            rep.learnedStepScales = Dictionary(uniqueKeysWithValues: f.learnedStepScales.map { ($0.key.rawValue, $0.value) })
+            rep.stepScaleAbsorbed = calibrator.absorbed
+        }
         return rep
     }
 
@@ -383,11 +501,19 @@ public enum SessionEvaluator {
         /// 地图在参考位置的均值 / 标准差；nil = 那里没数据
         public var mean: MagneticFeature?
         public var sigma: MagneticFeature?
+        /// 参考位置（地图坐标，cm）
+        public var reference: Point2 = .zero
     }
 
-    public static func residualSamples(dir: URL, field: MagneticFieldMap, everyCm: Double = 50) throws -> [ResidualSample] {
-        let s = try SurveySessionLoader.load(dir)
-        guard let ref = Self.loadTruth(dir) else { return [] }
+    /// - map: 给了时，没有 truth.csv 的会话（自采建图会话，留一法）用它自己的对齐结果（锚点 + 贴通道）当参考，和 evaluate 一样
+    public static func residualSamples(dir: URL, field: MagneticFieldMap, map: StoreMap? = nil, everyCm: Double = 50) throws -> [ResidualSample] {
+        let truth = Self.loadTruth(dir)
+        let s = try SurveySessionLoader.load(dir, requireAnchors: truth == nil, mapOriginOffsetCm: map?.originOffsetCm ?? .zero)
+        var ref: [(tMs: Int64, p: Point2)]
+        if let truth { ref = truth } else if let map {
+            ref = SurveyMapBuilder(widthCm: map.width, heightCm: map.height, crosses: map.crosses).add(s).track
+        } else { return [] }
+        guard ref.count > 1 else { return [] }
         func refAt(_ t: Int64) -> Point2? {
             var lo = 0, hi = ref.count - 1
             guard hi > 0, t >= ref[0].tMs, t <= ref[hi].tMs else { return nil }
@@ -415,7 +541,7 @@ public enum SessionEvaluator {
                 nextAt = path + everyCm
                 guard let f = sh.latestFeature, let r = refAt(p.tMs) else { continue }
                 let m = field.sample(at: r)
-                out.append(ResidualSample(tMs: p.tMs, pathCm: path, feature: f, mean: m?.mean, sigma: m?.sigma))
+                out.append(ResidualSample(tMs: p.tMs, pathCm: path, feature: f, mean: m?.mean, sigma: m?.sigma, reference: r))
             }
         }
         return out

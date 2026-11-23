@@ -54,13 +54,15 @@ public final class ShadowLocalizer {
     ///   （蓝牙粗定位 / 标签范围）时起作用，走够路、峰够突出才宣布定到，宁可不报也不报错的。默认关（原有行为）。
     /// - Parameter visualOdometry: 冷启动配置档按哪种运动来源取（`MagneticConfig.liveColdStart`）。默认 true（ARKit 位姿，原有行为）；
     ///   评估器的 `.pdrIMU`（真实计步推算）传 false，和 App 不开视觉里程计时的冷启动一致。
+    /// - Parameter mapAreaM2: 地图外框面积（m²），和 App 实时定位页一样传给 `liveColdStart`：小场地的冷启动搜索更强
+    ///   （`SmallMapColdStart`）。nil = 不知道（原有行为；采集时的影子定位不传）。评估器传地图的外框面积。
     public init(field: MagneticFieldMap, walkable: WalkableMap?, useRawMag: Bool,
                 configure: ((inout MagneticConfig) -> Void)? = nil, seed: UInt64 = 1, coldStartGate: Bool = false,
-                visualOdometry: Bool = true) {
+                visualOdometry: Bool = true, mapAreaM2: Double? = nil) {
         // 和实时定位页的冷启动同一份配置档（hybridOffset 实测同会话 P90 258→131 cm、首次定位 7→4 m，见 docs/roadmap.md），
         // 只有一处不同：采集时的影子定位 / 自动起点、评估默认照旧在只靠地磁时也报位置；
         // App 的行为（只靠地磁不报）用 hpass-eval --no-mag-only-cold-fix（Lab 的冷启动场景都这样跑）
-        var cfg = MagneticConfig.liveColdStart(visualOdometry: visualOdometry)
+        var cfg = MagneticConfig.liveColdStart(visualOdometry: visualOdometry, mapAreaM2: mapAreaM2)
         cfg.magOnlyColdStartReports = true
         if coldStartGate {
             cfg.applyColdStartGate()
@@ -206,11 +208,22 @@ public final class ShadowLocalizer {
 /// 地磁定位精度统计：参考轨迹（采集时 ARKit + 贴通道）和地磁定位的位置比。
 public final class LocalizationEvaluator {
     public private(set) var errors: [Double] = []
+    /// 和 `errors` 一一对应：报的 1σ 不确定度（cm，`MagneticEstimate.uncertaintyCm`；不是有限正数时记 −1 = 没报）。
+    /// 量不确定度标定得诚不诚实（误差 / 不确定度的中位、落在 1σ / 2σ 以内的比例）
+    public private(set) var uncertainties: [Double] = []
     public private(set) var firstFixPathCm: Double?
     public private(set) var jumps = 0
     public private(set) var pathCm = 0.0
+    /// 跳点 / 来回抖：相邻两个有把握的打分点之间，估计走过的路（Σ|Δ估计|）和参考走过的路（Σ|Δ参考|）；
+    /// 两者之比 = 报的轨迹比真实轨迹长多少倍（1 = 不抖）
+    public private(set) var estPathCm = 0.0
+    public private(set) var refPathFixCm = 0.0
+    /// 相邻两个有把握的打分点之间估计挪动超过 `bigJumpCm` 的次数（每次打分只走约 20 cm，挪这么远就是跳）
+    public private(set) var bigJumps = 0
+    public static let bigJumpCm = 300.0
     private var lastRef: Point2?
     private var lastEst: Point2?
+    private var lastFixRef: Point2?
 
     public init() {}
 
@@ -218,11 +231,19 @@ public final class LocalizationEvaluator {
     public func add(estimate e: MagneticEstimate, reference r: Point2) {
         if let l = lastRef { pathCm += r.distance(to: l) }
         lastRef = r
-        guard e.converged else { lastEst = nil; return }
+        guard e.converged else { lastEst = nil; lastFixRef = nil; return }
         if firstFixPathCm == nil { firstFixPathCm = pathCm }
-        if let le = lastEst, e.position.distance(to: le) > 200 { jumps += 1 }
+        if let le = lastEst {
+            let d = e.position.distance(to: le)
+            if d > 200 { jumps += 1 }
+            if d > Self.bigJumpCm { bigJumps += 1 }
+            estPathCm += d
+            if let lr = lastFixRef { refPathFixCm += r.distance(to: lr) }
+        }
         lastEst = e.position
+        lastFixRef = r
         errors.append(e.position.distance(to: r))
+        uncertainties.append(e.uncertaintyCm.isFinite && e.uncertaintyCm > 0 ? e.uncertaintyCm : -1)
     }
 
     public func percentile(_ q: Double) -> Double? {

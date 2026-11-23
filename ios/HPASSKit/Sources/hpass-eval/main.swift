@@ -12,6 +12,22 @@ import HPASSKit
 //   --track-out track.csv         每个运动节拍一行估计 + 参考（tools/lab/office_metrics.py 用）
 //   --carry-motion                pdr-imu 时打开携带无关的运动模型 + 粒子按携带模式重撒 + 步长 K 在线标定（App 同一套接法）
 //   --stationary-freeze           pdr-imu 时打开静止冻结（惯导说没在动就算静止；办公室坐着不动用，配合 --rooms）
+//   --dr-dump dr.csv              诊断：只对 --test 跑纯计步推算（起点 / 朝向取参考轨迹），逐拍写 CSV，给 tools/bench/dr_decompose.py 拆误差
+//   --residuals res.csv           只导出测试会话「实测特征 vs 地图在参考位置」的残差（含参考坐标），不跑定位；
+//                                 没有 truth.csv 的会话用它自己的锚点对齐当参考（留一法，tools/bench/map_cv.py 用）
+//   --field-out field.json        把建好的磁场图（magField 节点）写出来
+//   --carry-k                     pdr-imu + --carry-motion 时按 App 的做法跨会话带着在线标定学到的分模式步长 K（StepScaleStore）：
+//                                 测试会话按开始时间排序依次回放，第 k 次回放的每个会话从前一个会话结束时学到的 K 开始
+//                                 （第一个会话从 --k-state 读到的、或空 = App 第一次用）。报告带 sequenceIndex
+//   --k-state k.json              --carry-k 的初始 / 结束状态（每次回放一份；文件存在就先读，回放完写回）：留一法逐折串起来用
+//   --vio-k                       --carry-k 时每个测试会话回放（摄像头关）之后，再用它自己的 ARKit 位姿按 App 的视觉里程计标定
+//                                 学一遍 K（这段路当时若是开着摄像头增强定位，App 会学到的；App 测绘时不学 K），带给下一个会话。合成位姿（公开数据集）别用
+//   --posterior-k                 对照：按原来的做法把粒子步长比例后验写进 K（StepScaleCalibrator.learnFromPosterior）
+//   --step-scale x                诊断：惯导步长整体乘 x（FusionConfig.stepLengthScale）
+//   --odo-out odo.csv             诊断：每个运动节拍一行纯推算位置（pdr-imu：惯导输出；poses：只转了方向的位姿）+ 参考 + 估计
+//                                 + 粒子步长比例的加权中位数 / 标准差 + 生效的步长 K
+//   --fill-radius cm / --gp-length cm / --fill gp|idw   磁场图补空格的试验开关（默认 = 产品设置 150 / 100 / gp）
+//   --no-tracking-calibration / --tracking-temperature T   跟踪似然的地图标定：不标定（老地图）/ 直接给温度（默认建图会话两折交叉验证标定）
 
 func arg(_ name: String) -> String? {
     guard let i = CommandLine.arguments.firstIndex(of: name), i + 1 < CommandLine.arguments.count else { return nil }
@@ -34,6 +50,17 @@ guard let mapPath = arg("--map") else {
 }
 do {
     let map = try StoreDataLoader.loadMap(Data(contentsOf: URL(fileURLWithPath: mapPath)))
+    // 诊断：--test 的每个会话只跑纯计步推算（不建图、不定位），逐拍和参考轨迹一起写成 CSV（tools/bench/dr_decompose.py 拆误差）
+    if let dp = arg("--dr-dump") {
+        var lines = [DeadReckoningDump.csvHeader]
+        for t in list(arg("--test")) {
+            let rows = try DeadReckoningDump.run(dir: t, map: map, carryMotion: CommandLine.arguments.contains("--carry-motion"))
+            lines += DeadReckoningDump.csvLines(session: t.lastPathComponent, rows: rows)
+        }
+        try (lines.joined(separator: "\n") + "\n").write(toFile: dp, atomically: true, encoding: .utf8)
+        print("纯推算已写到 \(dp)")
+        exit(0)
+    }
     let build = list(arg("--build")), test = list(arg("--test"))
     guard !build.isEmpty, !test.isEmpty else { print("--build 和 --test 都要给"); exit(2) }
     let overlap = Set(build.map(\.standardizedFileURL)).intersection(test.map(\.standardizedFileURL))
@@ -54,9 +81,26 @@ do {
     let mapMode = modes[arg("--map-build") ?? "fusion"] ?? .fusion
     // --wifi：Wi-Fi 冷启动（只有 Android 能扫 Wi-Fi；见 WiFiColdStartProfile），用建图会话的 wifi.csv 建指纹
     let useWiFi = CommandLine.arguments.contains("--wifi")
+    // 磁场图补空格的试验开关（默认 = 产品的设置）
+    if let v = arg("--fill-radius").flatMap(Double.init) { MagneticFieldBuilder.defaultFillRadiusCm = v }
+    if let v = arg("--fill").flatMap(MagneticFieldBuilder.FillMethod.init(rawValue:)) { MagneticFieldBuilder.defaultFillMethod = v }
+    if let v = arg("--gp-length").flatMap(Double.init) { MagneticFieldBuilder.defaultGPLengthCm = v }
     let built = try SessionEvaluator.buildMaps(sessions: build, map: map, mode: mapMode, tagPositions: refTags ?? [:],
                                                withWiFi: useWiFi)
-    let field = built.field, bleMap = built.ble
+    var field = built.field
+    let bleMap = built.ble
+    // 跟踪似然的地图标定（和 hpass-build 出图时同一份，见 SessionEvaluator.trackingCalibration）。只有已知起点的跟踪用得到，
+    // 冷启动不算（省时间）。--tracking-temperature T 直接给（≤ 0 = 不标定），--no-tracking-calibration = 老地图（不带标定）
+    if let v = arg("--tracking-temperature").flatMap(Double.init) {
+        field.trackingTemperature = v > 0 ? v : nil
+    } else if CommandLine.arguments.contains("--oracle-start") && !CommandLine.arguments.contains("--no-tracking-calibration") {
+        let cal = SessionEvaluator.trackingCalibration(sessions: build, map: map, mode: mapMode, tagPositions: refTags ?? [:])
+        field.trackingTemperature = cal?.temperature
+        let per = cal?.perDistance.map { String(format: "%.1f m：%d 窗、LLR %.2f、T %.1f", $0.distanceCm / 100, $0.windows, $0.meanLLR, $0.temperature) }
+        print("跟踪似然标定：" + (cal.map { String(format: "温度 %.1f", $0.temperature)
+            + ($0.temperature <= TrackingCalibration.maxTemperature ? "（计步跟踪用粒子偏移似然）" : "（超过 \(Int(TrackingCalibration.maxTemperature))，照旧）") } ?? "没标定")
+              + (per.map { "；" + $0.joined(separator: "，") } ?? ""))
+    }
     for r in built.reports {
         let off = r.offsetUT.map { String(format: "，偏移 |B| %+.1f Bz %+.1f Bh %+.1f µT", $0.total, $0.vertical, $0.horizontal) } ?? ""
         print("建图 \(r.name)：样本 \(r.samplesUsed)" + off + (r.warnings.isEmpty ? "" : "，⚠️ \(r.warnings.joined(separator: "；"))"))
@@ -70,6 +114,7 @@ do {
         summary += built.magExcluded.isEmpty ? "（仍在磁场图里；云端出图会排除）" : "（磁场图没用）"
     }
     summary += "，磁场 \(field.coveredCells) 格"
+    if let t = field.trackingTemperature { summary += String(format: "，跟踪似然标定温度 %.1f", t) }
     print(summary)
     print("磁场图：有数据 \(field.coveredCells) 格；蓝牙指纹：\(bleMap.map { "\($0.tags.count) 个标签" } ?? "无")")
     if useWiFi {
@@ -88,15 +133,20 @@ do {
         ble = TagLocations.seededBLEMap(TagLocations.parse(t, map: map), learned: bleMap)
         print("蓝牙底图：标签位置表 + 学到的，\(ble!.tags.count) 个标签")
     }
+    // 诊断：把建好的磁场图（magField 节点）写出来
+    if let fp = arg("--field-out") {
+        try JSONSerialization.data(withJSONObject: field.jsonObject()).write(to: URL(fileURLWithPath: fp))
+    }
     // 诊断：只导出测试会话「实测特征 vs 地图在参考位置」的残差（每 50 cm 一条），不跑定位
     if let rp = arg("--residuals") {
-        var csv = "session,t_ms,path_cm,f_total,f_vertical,f_horizontal,m_total,m_vertical,m_horizontal,s_total,s_vertical,s_horizontal" + "\n"
+        var csv = "session,t_ms,path_cm,f_total,f_vertical,f_horizontal,m_total,m_vertical,m_horizontal,s_total,s_vertical,s_horizontal,ref_x,ref_y" + "\n"
         func f3(_ v: MagneticFeature?) -> String {
             v.map { String(format: "%.3f,%.3f,%.3f", $0.total, $0.vertical, $0.horizontal) } ?? ",,"
         }
         for t in test {
-            for r in try SessionEvaluator.residualSamples(dir: t, field: field) {
-                csv += "\(t.lastPathComponent),\(r.tMs),\(String(format: "%.1f", r.pathCm)),\(f3(r.feature)),\(f3(r.mean)),\(f3(r.sigma))" + "\n"
+            for r in try SessionEvaluator.residualSamples(dir: t, field: field, map: map) {
+                csv += "\(t.lastPathComponent),\(r.tMs),\(String(format: "%.1f", r.pathCm)),\(f3(r.feature)),\(f3(r.mean)),\(f3(r.sigma)),"
+                    + String(format: "%.1f,%.1f", r.reference.x, r.reference.y) + "\n"
             }
         }
         try csv.write(toFile: rp, atomically: true, encoding: .utf8)
@@ -105,7 +155,8 @@ do {
     }
     // --rooms：办公室地图（有单元 / 门 / 墙）用房间约束（不经门不能换房间）并在估计里带房间，见 RoomGraph
     let useRooms = CommandLine.arguments.contains("--rooms")
-    let walk = SessionEvaluator.walkable(map, rooms: useRooms)
+    // --no-walkable：诊断，粒子滤波不用可走区域（不撞墙、没有通道走向先验），看墙对某个量（例如步长比例后验）的影响
+    let walk = CommandLine.arguments.contains("--no-walkable") ? nil : SessionEvaluator.walkable(map, rooms: useRooms)
     if useRooms { print(walk?.rooms.map { "房间约束：\($0.rooms.count) 个单元、\($0.doors.count) 扇门、\($0.openSeams) 段没墙的分界" } ?? "房间约束：地图没有单元，不用") }
     var out: [EvalReport] = []
     // 粒子滤波有随机性（加上字典遍历顺序每次不同），单次结果波动很大：--runs N 跑 N 次（不同随机种子），报中位和范围
@@ -125,16 +176,43 @@ do {
     if motion == .pdrIMU { print("运动来源：真实 IMU 计步推算（FusionEngine）" + (CommandLine.arguments.contains("--oracle-start") ? "，起步朝向 \(startHeading.rawValue)" : "")) }
     // --track-out：每个运动节拍一行（会话、第几次、时刻、估计、是否有把握、不确定度、参考），给 tools/lab/office_metrics.py
     let trackOut = arg("--track-out")
+    // --odo-out：诊断用，--motion pdr-imu 时每个运动节拍一行纯推算位置（惯导引擎输出）+ 参考 + 滤波估计
+    let odoOut = arg("--odo-out")
+    // --diag-out：诊断用，每个运动节拍一行估计 + 参考 + 置信度 + 粒子散布 / 航向散布 / 步长比例（每拍多扫一遍粒子，只给诊断）
+    let diagOut = arg("--diag-out")
+    if diagOut != nil { SessionEvaluator.trackDiagnostics = true }
+    var diagLines = ["session,run,t_ms,est_x,est_y,converged,unc_cm,ref_x,ref_y,confidence,spread_cm,heading_spread_deg,scale_median,scale_sigma,odo_x,odo_y,heading_hist,spread_est_cm,mean_x,mean_y"]
+    var odoLines = ["session,run,t_ms,odo_x,odo_y,ref_x,ref_y,est_x,est_y,converged,unc_cm,scale_med,scale_sigma,step_k"]
     var trackLines = ["session,run,t_ms,est_x,est_y,converged,unc_cm,ref_x,ref_y,room_id,room_mass,carry_mode,frozen"]
     let carryMotion = CommandLine.arguments.contains("--carry-motion")
     let stationaryFreeze = CommandLine.arguments.contains("--stationary-freeze")
     if motion == .pdrIMU && (carryMotion || stationaryFreeze) {
         print("运动模型：" + [carryMotion ? "携带无关（按携带模式重撒 + K 在线标定）" : nil, stationaryFreeze ? "静止冻结" : nil].compactMap { $0 }.joined(separator: "，"))
     }
-    for t in test {
+    // --carry-k：测试会话按开始时间（imu.csv 第一个时刻）排序，每次回放各自带着学到的 K 往下传
+    let carryK = CommandLine.arguments.contains("--carry-k")
+    let vioK = CommandLine.arguments.contains("--vio-k")
+    let fixedStepScale = arg("--step-scale").flatMap(Double.init) ?? 1
+    struct KState: Codable { var sessions = 0; var runs: [String: [String: Double]] = [:] }
+    var kState = KState()
+    let kStatePath = arg("--k-state")
+    if let p = kStatePath, let d = FileManager.default.contents(atPath: p), let st = try? JSONDecoder().decode(KState.self, from: d) {
+        kState = st
+    }
+    func firstImuMs(_ u: URL) -> Int64 {
+        guard let txt = try? String(contentsOf: u.appendingPathComponent("imu.csv"), encoding: .utf8) else { return 0 }
+        let lines = txt.split(separator: "\n", maxSplits: 2)
+        return lines.count > 1 ? Int64(lines[1].split(separator: ",").first ?? "") ?? 0 : 0
+    }
+    let orderedTest = carryK ? test.sorted { (firstImuMs($0), $0.lastPathComponent) < (firstImuMs($1), $1.lastPathComponent) } : test
+    if carryK { print("跨会话带 K：\(orderedTest.count) 个测试会话按时间顺序回放（之前已回放 \(kState.sessions) 个）") }
+    for (ti, t) in orderedTest.enumerated() {
         var rs: [EvalReport] = []
         for k in 0..<runs {
-            let r = try SessionEvaluator.evaluate(dir: t, map: map, field: field, ble: ble, walkable: walk,
+            let kIn: [CarryMode: Double] = carryK
+                ? Dictionary(uniqueKeysWithValues: (kState.runs[String(k + 1)] ?? [:]).compactMap { kv in CarryMode(rawValue: kv.key).map { ($0, kv.value) } })
+                : [:]
+            var r = try SessionEvaluator.evaluate(dir: t, map: map, field: field, ble: ble, walkable: walk,
                                                   crossCheck: !CommandLine.arguments.contains("--no-crosscheck"), configure: { cfg in
                 if CommandLine.arguments.contains("--offset") { cfg.offsetInvariant = true }
                 if CommandLine.arguments.contains("--hybrid") { cfg.hybridOffset = true }
@@ -150,6 +228,12 @@ do {
                 if let v = arg("--obs-sigma-floor").flatMap(Double.init) { cfg.observationSigmaFloorUT = v }
                 if let v = arg("--mag-corr-cm").flatMap(Double.init) { cfg.magneticCorrelationCm = v }
                 if let v = arg("--converged-mag-weight").flatMap(Double.init) { cfg.convergedMagWeight = v }
+                // 每个粒子自己估偏移（MagneticConfig.particleOffsetFilter）的试验开关
+                // （只改跟踪配置档：冷启动的配置档不动）
+                if cfg.trackingOdometry != nil, let v = arg("--particle-offset").flatMap(Int.init) { cfg.particleOffsetFilter = v != 0 }
+                if let v = arg("--po-q").flatMap(Double.init) { cfg.particleOffsetWalkVarUT2 = v }
+                if let v = arg("--po-r").flatMap(Double.init) { cfg.particleOffsetWhiteVarUT2 = v }
+                if let v = arg("--po-temp").flatMap(Double.init) { cfg.particleOffsetTemperature = v }
                 if let v = arg("--offset-warmup").flatMap(Int.init) { cfg.offsetWarmupUpdates = v }
                 if let v = arg("--offset-window").flatMap(Int.init) { cfg.offsetMedianWindow = v }
                 if let v = arg("--lost-updates").flatMap(Int.init) { cfg.lostUpdates = v }
@@ -157,6 +241,17 @@ do {
                 if let v = arg("--lost-confidence-prior").flatMap(Double.init) { cfg.lostConfidenceWithExternalPrior = v }
                 if let v = arg("--confidence-scale").flatMap(Double.init) { cfg.confidenceScaleCm = v }
                 if let v = arg("--cluster-radius").flatMap(Double.init) { cfg.clusterRadiusCm = v }
+                // 运动模型的试验开关（默认不给 = 用配置档里的值）
+                if let v = arg("--init-scale-sigma").flatMap(Double.init) { cfg.initialScaleSigma = v }
+                if let v = arg("--scale-walk").flatMap(Double.init) { cfg.scaleWalkPerM = v }
+                if let v = arg("--heading-walk").flatMap(Double.init) { cfg.headingBiasWalkDegPerM = v }
+                if let v = arg("--init-heading-sigma").flatMap(Double.init) { cfg.initialHeadingBiasSigmaDeg = v }
+                if let v = arg("--pos-noise").flatMap(Double.init) { cfg.positionNoiseFraction = v }
+                if let v = arg("--conv-pos-noise").flatMap(Double.init) { cfg.convergedPositionNoiseFraction = v }
+                if let v = arg("--particles").flatMap(Int.init) { cfg.particleCount = v }
+                if let v = arg("--jump-confirm").flatMap(Int.init) { cfg.jumpConfirmUpdates = v }
+                if let v = arg("--keep-near").flatMap(Int.init) { cfg.keepClusterRequiresNear = v != 0 }
+                if let v = arg("--blocked-penalty").flatMap(Double.init) { cfg.blockedPenalty = v }
                 if CommandLine.arguments.contains("--hard-ble-tracking") { cfg.bleSoftTracking = false }
                 if CommandLine.arguments.contains("--ble-soft-no-recover") { cfg.bleSoftLocalRecovery = false }
                 if let w = arg("--ble-soft-weight").flatMap(Double.init) { cfg.bleSoftPriorWeight = w }
@@ -171,6 +266,11 @@ do {
                 // 只靠地磁的冷启动不报位置（产品决定，见 MagneticConfig.magOnlyColdStartReports）
                 if CommandLine.arguments.contains("--no-mag-only-cold-fix") { cfg.magOnlyColdStartReports = false }
                 if let v = arg("--uniform-inject").flatMap(Int.init) { cfg.uniformHeadingForInjection = v != 0 }
+                // 冷启动搜索的试验开关（默认按地图面积取，见 SmallMapColdStart）：粒子数、挑战者开关 / 门限 / 粒子数
+                if let v = arg("--cold-particles").flatMap(Int.init) { cfg.coldStartParticleCount = v }
+                if let v = arg("--challenger").flatMap(Int.init) { cfg.coldChallenger = v != 0 }
+                if let v = arg("--challenger-bf").flatMap(Double.init) { cfg.coldChallengerLogBayesFactor = v }
+                if let v = arg("--challenger-particles").flatMap(Int.init) { cfg.coldChallengerParticleCount = v }
             }, seed: UInt64(k + 1), refTagPositions: refTags,
                                                   oracleStart: CommandLine.arguments.contains("--oracle-start"),
                                                   odometry: odometry,
@@ -178,12 +278,46 @@ do {
                                                   coldStartGate: CommandLine.arguments.contains("--cold-gate"),
                                                   wifi: useWiFi ? built.wifi : nil, motion: motion, startHeading: startHeading,
                                                   carryMotion: carryMotion, stationaryFreeze: stationaryFreeze,
-                                                  onTrack: trackOut == nil ? nil : { p in
+                                                  stepLengthScale: fixedStepScale, learnedStepScales: kIn,
+                                                  scaleDiagnostics: odoOut != nil,
+                                                  posteriorStepScale: CommandLine.arguments.contains("--posterior-k"),
+                                                  onTrack: trackOut == nil && odoOut == nil && diagOut == nil ? nil : { p in
                 func f1(_ v: Double?) -> String { v.map { String(format: "%.1f", $0) } ?? "" }
+                func f3(_ v: Double?) -> String { v.map { String(format: "%.3f", $0) } ?? "" }
+                if diagOut != nil {
+                    diagLines.append("\(t.lastPathComponent),\(k + 1),\(p.tMs),\(f1(p.estimate?.x)),\(f1(p.estimate?.y)),\(p.converged ? 1 : 0),"
+                                     + "\(f1(p.uncertaintyCm.flatMap { $0.isFinite ? $0 : nil })),\(f1(p.reference.x)),\(f1(p.reference.y)),"
+                                     + "\(f3(p.confidence)),\(f1(p.spreadCm.flatMap { $0.isFinite ? $0 : nil })),\(f1(p.headingSpreadDeg)),"
+                                     + "\(f3(p.scaleMedian)),\(f3(p.scaleSigma)),\(f1(p.odometry?.x)),\(f1(p.odometry?.y)),"
+                                     + (p.headingHistogram ?? []).map { String(format: "%.2f", $0) }.joined(separator: ";")
+                                     + ",\(f1(p.spreadAroundEstimateCm)),\(f1(p.particleMean?.x)),\(f1(p.particleMean?.y))")
+                }
+                if odoOut != nil, let o = p.odometry {
+                    odoLines.append("\(t.lastPathComponent),\(k + 1),\(p.tMs),\(f1(o.x)),\(f1(o.y)),\(f1(p.reference.x)),\(f1(p.reference.y)),"
+                                    + "\(f1(p.estimate?.x)),\(f1(p.estimate?.y)),\(p.converged ? 1 : 0),\(f1(p.uncertaintyCm.flatMap { $0.isFinite ? $0 : nil })),"
+                                    + [p.scaleMedian, p.scaleSigma, p.stepK].map { $0.map { String(format: "%.4f", $0) } ?? "" }.joined(separator: ","))
+                }
                 trackLines.append("\(t.lastPathComponent),\(k + 1),\(p.tMs),\(f1(p.estimate?.x)),\(f1(p.estimate?.y)),"
                                   + "\(p.converged ? 1 : 0),\(f1(p.uncertaintyCm.flatMap { $0.isFinite ? $0 : nil })),\(f1(p.reference.x)),\(f1(p.reference.y)),"
                                   + "\(p.roomId ?? ""),\(p.roomId == nil ? "" : String(format: "%.3f", p.roomMass)),\(p.carryMode.rawValue),\(p.frozen ? 1 : 0)")
             })
+            if carryK {
+                r.sequenceIndex = kState.sessions + ti
+                var kOut = r.learnedStepScales ?? [:]
+                if vioK {
+                    let start = Dictionary(uniqueKeysWithValues: kOut.compactMap { kv in CarryMode(rawValue: kv.key).map { ($0, kv.value) } })
+                    let v = try SessionEvaluator.learnStepScalesFromVIO(dir: t, initial: start)
+                    kOut = Dictionary(uniqueKeysWithValues: v.scales.map { ($0.key.rawValue, $0.value) })
+                    print("  [K] \(t.lastPathComponent) 视觉里程计标定 \(v.updates) 次，比值 "
+                          + v.ratios.map { String(format: "%.3f", $0) }.joined(separator: " "))
+                }
+                kState.runs[String(k + 1)] = kOut
+                func fmt(_ d: [String: Double]) -> String {
+                    d.keys.sorted().map { key in key + " " + String(format: "%.3f", d[key]!) }.joined(separator: " ")
+                }
+                let kInS = Dictionary(uniqueKeysWithValues: kIn.map { ($0.key.rawValue, $0.value) })
+                print("  [K] \(t.lastPathComponent) 第 \(k + 1) 次：开始 \(fmt(kInS)) → 结束 \(fmt(kOut))（吸收 \(r.stepScaleAbsorbed ?? 0) 次）")
+            }
             if runs == 1 { print(r.line) }
             rs.append(r)
         }
@@ -213,10 +347,32 @@ do {
                          100 * Double(errs.filter { $0 <= 200 }.count) / Double(errs.count),
                          refN > 0 ? 100 * Double(errs.count) / Double(refN) : 0,
                          ff.isEmpty ? "—" : String(format: "%.1f m", q(ff, 0.5)), ff.count, out.count))
+            // 不确定度标定（报的 1σ 是均方根半径：二维高斯时 误差 / 1σ 的中位 0.83、63% 落在 1σ 内、98% 在 2σ 内）和跳点
+            let ratios = zip(out.flatMap(\.errorsCm), out.flatMap(\.uncertaintiesCm)).compactMap { $1 > 0 ? $0 / $1 : nil }.sorted()
+            let estP = out.reduce(0) { $0 + $1.estPathCm }, refP = out.reduce(0) { $0 + $1.refPathFixCm }
+            if !ratios.isEmpty {
+                print(String(format: "【稳健】误差/不确定度 中位 %.2f  1σ 内 %.0f%%  2σ 内 %.0f%%  轨迹长度比 %.2f  跳 >3 m %.2f 次/100 m",
+                             q(ratios, 0.5), 100 * Double(ratios.filter { $0 <= 1 }.count) / Double(ratios.count),
+                             100 * Double(ratios.filter { $0 <= 2 }.count) / Double(ratios.count),
+                             refP > 0 ? estP / refP : 0, refP > 0 ? Double(out.reduce(0) { $0 + $1.bigJumps }) / (refP / 10_000) : 0))
+            }
         } else { print("【汇总】没有任何定位结果") }
     }
     let all = out.compactMap(\.medianCm)
     if all.count > 1 { print(String(format: "测试会话中位误差的中位：%.0f cm", all.sorted()[all.count / 2])) }
+    if carryK, let p = kStatePath {
+        kState.sessions += orderedTest.count
+        let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try enc.encode(kState).write(to: URL(fileURLWithPath: p))
+    }
+    if let p = odoOut {
+        try (odoLines.joined(separator: "\n") + "\n").write(toFile: p, atomically: true, encoding: .utf8)
+        print("纯推算轨迹已写到 \(p)（\(odoLines.count - 1) 行）")
+    }
+    if let p = diagOut {
+        try (diagLines.joined(separator: "\n") + "\n").write(toFile: p, atomically: true, encoding: .utf8)
+        print("诊断轨迹已写到 \(p)（\(diagLines.count - 1) 行）")
+    }
     if let p = trackOut {
         try (trackLines.joined(separator: "\n") + "\n").write(toFile: p, atomically: true, encoding: .utf8)
         print("逐点轨迹已写到 \(p)（\(trackLines.count - 1) 行）")

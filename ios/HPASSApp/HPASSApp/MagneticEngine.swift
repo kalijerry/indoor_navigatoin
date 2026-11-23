@@ -1916,6 +1916,13 @@ final class MagneticEngine: ObservableObject {
     private nonisolated func handlePose(t: Int64, a: Point2, state: Int, pipe: MagPipeline) {
         pipe.latestA = a
         pipe.vioTracking = state
+        // 步长 K 的视觉里程计标定（HPASSKit StepScaleCalibrator.observeVisualOdometry）：ARKit 跟踪正常、在走路时
+        // 比同一段的惯导净位移和 ARKit 净位移，学到的分携带方式 K 存本机（StepScaleStore），摄像头关着的下次定位也用上。
+        // 只在惯导位置在更新时喂（lastFusedPos 只在这两种状态下逐拍更新）
+        if let f = pipe.fusion, let q = pipe.lastFusedPos,
+           (pipe.mode == .live && pipe.tracking) || pipe.mode == .localizing {
+            pipe.calibrator.observeVisualOdometry(tMs: t, ar: a, trackingNormal: state == 2, pdr: q, engine: f)
+        }
         guard pipe.vioEnabled, pipe.mode == .live || pipe.mode == .localizing, pipe.tracking else { return }
         if let pending = pipe.vioPending, state == 2 {
             switch pending {

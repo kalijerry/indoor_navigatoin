@@ -26,6 +26,8 @@ public enum OdometrySource: String, CaseIterable {
 ///   （`coverageGatedMagWeight`）：一段没采过的路上完全靠推算；
 /// - 地磁似然按实测残差标定（`TrackingProfile.observationSigmaFloorUT` / `magneticCorrelationCm`），
 ///   整体偏移不用单次读数估，攒够一段再取中位数（`offsetWarmupUpdates`）；
+///   地图带了跟踪似然标定（`MagneticFieldMap.trackingTemperature`）时，计步跟踪改用每个粒子自己估偏移的似然
+///   （`particleOffsetFromMap`），强度按这张图标定；
 /// - 蓝牙只做软约束（`bleSoftTracking`，底图学过本场地标签范围时；人工打点的标签表底图照旧硬约束）：
 ///   有上限的软范围约束，不挡收敛；持续对不上先局部找回，找回后蓝牙还是不认再升级成全图找。
 ///
@@ -111,9 +113,14 @@ public extension MagneticConfig {
         c.magneticCorrelationCm = TrackingProfile.magneticCorrelationCm
         c.offsetWarmupUpdates = TrackingProfile.offsetWarmupUpdates
         c.offsetMedianWindow = TrackingProfile.offsetMedianWindow
+        // 地图带跟踪似然标定（建图时交叉验证量出，见 TrackingCalibration）时，计步跟踪改用「每个粒子自己估偏移」的似然，
+        // 温度取地图的；没标定 / 标出来图上没有米级信息的照旧用上面这套
+        c.particleOffsetFromMap = true
         c.lostConfidence = TrackingProfile.lostConfidence
         c.lostConfidenceWithExternalPrior = TrackingProfile.lostConfidenceWithExternalPrior
         c.bleSoftTracking = true
+        // 报的不确定度用误差模型（ReportedUncertainty），不用簇内散布（太自信）
+        c.honestUncertainty = true
         return c
     }
 
@@ -136,14 +143,21 @@ public extension MagneticConfig {
             scaleWalkPerM = 0.003
             // 推算本身已经很准（公开数据集：中位 0.3 m），地磁只做很小的修正
             convergedMagWeight = pinnedConvergedMagWeight ?? 0.1
+            reportScaleSigma = ReportedUncertainty.vioScaleSigma
         case .pdr:
             // 起始朝向来自「面朝下一个点位」/ 在屏幕上指，比视觉里程计粗：8～10°
             initialHeadingBiasSigmaDeg = trackingHeadingKnown ? 10 : 30
             headingBiasWalkDegPerM = d.headingBiasWalkDegPerM
             positionNoiseFraction = d.positionNoiseFraction
+            // 步长比例先验照旧 1 + N(0, 0.06)。实测（hpass-eval --odo-out 的纯推算和真值比，调参开发集）每条会话的步长比例
+            // 跨设备在 0.83（ILC 安卓）～ 1.1～1.4（iPhone）之间，但把先验放宽（对数正态 σ 0.1～0.2、或 10～35% 的宽尾）
+            // 是有赢有输的交换：ILC 真实计步错定 30% → 15%，自采商场留一法误差中位 2.8 m → 3.3～5.6 m（10～20 个种子，越宽越差，
+            // 加粒子不改善），公开计步（public/pdr）覆盖掉 5～9 个点。试过的设置没有一个两边都不输，所以不改。
+            // 同样试过、更差的：转弯时按 0.2 × 转角额外撒航向、簇半径 4 m、朝向未知时等航向收拢再报。
             initialScaleSigma = d.initialScaleSigma
             scaleWalkPerM = d.scaleWalkPerM
             convergedMagWeight = pinnedConvergedMagWeight ?? 0.2
+            reportScaleSigma = ReportedUncertainty.pdrScaleSigma
         }
     }
 }
@@ -159,6 +173,7 @@ public extension MagneticConfig {
     /// 例外：小场地（地图外框面积 ≤ `magOnlyColdStartMaxAreaM2`，办公室 / 房间）只靠地磁也报位置。
     /// 办公室没有蓝牙标签、也没有货架标识牌，按上面的规则就永远定不到；商场的错定来自几千平米里
     /// 十几米的磁场序列能对上很多处，几百平米的房间里长得像的地方少得多。收敛门、远跳确认照旧。
+    /// 小场地报只靠地磁的定位，所以搜索也加强（见 `SmallMapColdStart`）：粒子更多，定到之后后台挑战者接着搜（`coldChallenger`）。
     /// - Parameters:
     ///   - visualOdometry: 视觉里程计在推粒子（ARKit 可用且打开了）。
     ///   - mapAreaM2: 地图外框面积（m²）；nil = 不知道，按大场地处理（不报）。
@@ -177,7 +192,15 @@ public extension MagneticConfig {
         }
         // 每次读数的整体水平会差 10～16 µT（磁力计偏置估计不同）：没定到按起伏找，定到后估出偏移再按绝对值比
         c.hybridOffset = true
+        // 报的不确定度用误差模型（ReportedUncertainty），不用簇内散布（太自信）
+        c.honestUncertainty = true
+        c.reportScaleSigma = visualOdometry ? ReportedUncertainty.vioScaleSigma : ReportedUncertainty.pdrScaleSigma
         c.magOnlyColdStartReports = magOnlyColdStartAllowed(mapAreaM2: mapAreaM2)
+        if magOnlyColdStartAllowed(mapAreaM2: mapAreaM2) {
+            c.coldStartParticleCount = SmallMapColdStart.particleCount
+            c.coldChallenger = true
+            c.coldChallengerParticleCount = SmallMapColdStart.challengerParticleCount
+        }
         return c
     }
 
@@ -189,6 +212,25 @@ public extension MagneticConfig {
         guard let a = mapAreaM2, a > 0 else { return false }
         return a <= magOnlyColdStartMaxAreaM2
     }
+}
+
+/// 小场地（`MagneticConfig.magOnlyColdStartAllowed`：办公室 / 房间）只靠地磁冷启动的搜索设置。
+///
+/// 冷启动不知道位置、航向，也不知道这次计步的步长比例，粒子要盖住 位置 × 航向 × 步长比例 四维。
+/// 实测计步的距离比例离 1 很远、而且每次不一样（公开 ILC 真实 IMU 手持：计步距离 / 真值 1.05～1.29；
+/// 自采办公室 iPhone 建图会话 0.36～0.92），按 1 ± 6% 撒的 6000 个粒子在几百平米里经常没有一个落在对的假设附近，
+/// 于是锁到长得像的地方；粒子权重是相对的，整团锁错之后自己判不了丢。
+/// - 粒子数：合成办公室（public/sim-office-phone，步长偏短 0.82）冷启动错定 6000 → 12000 → 24000 → 48000 个粒子
+///   65% → 52% → 42% → 37%（拐点在 24000；48000 再翻倍只多 5 个点）。只在找位置时用，定到之后照旧缩到 `particleCount`；
+/// - 挑战者（`MagneticConfig.coldChallenger`）：定到之后后台用常规冷启动的粒子数从零接着搜，另一个假设在同一段新观测上
+///   证据压过主滤波器（对数贝叶斯因子 ≥ ln 100）就换过去：合成办公室错定再 42% → 30%（ln 20 / ln 100 / ln 1000：
+///   26% / 30% / 28%，比较窗口 10 m / 20 m 一样）。
+/// 大场地不用：只靠地磁不报位置（商场上 24000 个粒子也还是 90% 错定），蓝牙 / Wi-Fi 先验在缩小范围。
+public enum SmallMapColdStart {
+    /// 冷启动（找位置时）的粒子数
+    public static let particleCount = 24000
+    /// 挑战者搜索时的粒子数（常规冷启动的数目：挑战者一直在后台跑，算力按常规冷启动给）
+    public static let challengerParticleCount = MagneticConfig().coldStartParticleCount
 }
 
 /// Wi-Fi 冷启动（只有 Android 能扫 Wi-Fi；评估 `--wifi`，场景 public/pdr/cold-wifi）：

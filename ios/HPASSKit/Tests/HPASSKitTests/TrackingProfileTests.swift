@@ -383,6 +383,95 @@ final class TrackingProfileTests: XCTestCase {
         XCTAssertFalse(l.magOnlyColdStartSuppressed)
     }
 
+    /// 小场地的冷启动搜索更强（SmallMapColdStart）：粒子更多、定到之后后台挑战者接着搜；大场地 / 面积不知道时照旧。
+    /// 评估的冷启动（ShadowLocalizer）传了地图面积就用同一套，不传（采集时的影子定位）照旧。
+    func testLiveColdStartSmallVenueSearch() {
+        let office = MagneticConfig.liveColdStart(visualOdometry: false, mapAreaM2: 300)
+        XCTAssertEqual(office.coldStartParticleCount, SmallMapColdStart.particleCount)
+        XCTAssertTrue(office.coldChallenger)
+        XCTAssertEqual(office.coldChallengerParticleCount, SmallMapColdStart.challengerParticleCount)
+        XCTAssertEqual(SmallMapColdStart.challengerParticleCount, MagneticConfig().coldStartParticleCount)
+        XCTAssertEqual(office.particleCount, MagneticConfig().particleCount)
+        for big in [MagneticConfig.liveColdStart(visualOdometry: false, mapAreaM2: 4613),
+                    MagneticConfig.liveColdStart(visualOdometry: true, mapAreaM2: nil), MagneticConfig()] {
+            XCTAssertEqual(big.coldStartParticleCount, MagneticConfig().coldStartParticleCount)
+            XCTAssertFalse(big.coldChallenger)
+        }
+        XCTAssertTrue(ShadowLocalizer(field: world(), walkable: nil, useRawMag: false, mapAreaM2: 240).localizer.config.coldChallenger)
+        XCTAssertFalse(ShadowLocalizer(field: world(), walkable: nil, useRawMag: false).localizer.config.coldChallenger)
+        XCTAssertFalse(ShadowLocalizer(field: world(), walkable: nil, useRawMag: false, mapAreaM2: 4613).localizer.config.coldChallenger)
+    }
+
+    /// 冷启动挑战者：只靠地磁冷启动定到之后整团粒子锁到了错的地方（这里直接把粒子挪到 20 m 外），
+    /// 粒子权重是相对的，主滤波器自己照样「有把握」；后台挑战者从零搜到对的地方，在同一段观测上证据压过主滤波器，
+    /// 换过去，估计回到真值附近。
+    func testColdChallengerReplacesWrongLock() {
+        let map = world(period: nil)
+        var cfg = MagneticConfig.liveColdStart(visualOdometry: false, mapAreaM2: 240)
+        cfg.coldStartParticleCount = 4000
+        cfg.coldChallengerParticleCount = 4000
+        let loc = MagneticLocalizer(field: map, config: cfg, seed: 3)
+        loc.reset(start: nil, headingUnknown: true)
+        var truth = Point2(400, 200)
+        var dir = 1.0
+        var moved = false, lockedWrong = false
+        var lastErr = Double.infinity
+        for _ in 0..<1600 {
+            if truth.x > 5600 { dir = -1 } else if truth.x < 400 { dir = 1 }
+            let step = Point2(25 * dir, 0)
+            truth = truth + step
+            let e = loc.step(delta: pdr(step), feature: g(truth.x))
+            if e.converged && !moved {
+                XCTAssertTrue(loc.challengerActive, "只靠地磁冷启动定到之后挑战者就该在后台搜")
+                // 锁错：整团粒子挪到 20 m 外（航向偏差、步长比例不变）
+                loc.moveParticlesForTesting(fraction: 1, to: Point2(truth.x < 3000 ? truth.x + 2000 : truth.x - 2000, 200), spreadCm: 40)
+                moved = true
+                continue
+            }
+            if moved && e.converged && e.position.distance(to: truth) > 1000 { lockedWrong = true }
+            if e.converged { lastErr = e.position.distance(to: truth) }
+            if loc.challengerSwaps > 0 && lastErr < 200 { break }
+        }
+        XCTAssertTrue(moved, "冷启动该定到")
+        XCTAssertTrue(lockedWrong, "挪走之后主滤波器先锁在错的地方")
+        XCTAssertGreaterThanOrEqual(loc.challengerSwaps, 1)
+        XCTAssertLessThan(lastErr, 200, "换成挑战者之后应回到真值附近，误差 \(Int(lastErr)) cm")
+    }
+
+    /// 挑战者只在「只靠地磁的冷启动」里跑：已知起点、用过外部位置先验（蓝牙等）、没打开时都不跑。
+    func testColdChallengerOnlyForMagOnlyColdStart() {
+        let map = world(period: nil)
+        var cfg = MagneticConfig.liveColdStart(visualOdometry: false, mapAreaM2: 240)
+        cfg.coldStartParticleCount = 3000
+        cfg.coldChallengerParticleCount = 3000
+        // 走 50 m（x 400 → 5400 cm），留在 60 m 走廊里：走出地图后收敛状态取决于浮点细节，macOS / Linux 会不一样
+        func walk(_ l: MagneticLocalizer, prior: Bool = false) {
+            var truth = Point2(400, 200)
+            for k in 0..<200 {
+                truth = truth + Point2(25, 0)
+                if prior && k % 4 == 0 { l.applyPositionPrior(truth, sigmaCm: 300, weight: 1) }
+                l.step(delta: pdr(Point2(25, 0)), feature: g(truth.x))
+            }
+        }
+        let known = MagneticLocalizer(field: map, config: cfg, seed: 4)
+        known.reset(start: Point2(400, 200), spreadCm: 50)
+        walk(known)
+        XCTAssertFalse(known.challengerActive)
+        let ble = MagneticLocalizer(field: map, config: cfg, seed: 4)
+        ble.reset(start: nil, headingUnknown: true)
+        walk(ble, prior: true)
+        XCTAssertTrue(ble.isConverged)
+        XCTAssertFalse(ble.challengerActive)
+        var off = cfg
+        off.coldChallenger = false
+        let plain = MagneticLocalizer(field: map, config: off, seed: 4)
+        plain.reset(start: nil, headingUnknown: true)
+        walk(plain)
+        XCTAssertTrue(plain.isConverged)
+        XCTAssertFalse(plain.challengerActive)
+        XCTAssertEqual(plain.challengerSwaps, 0)
+    }
+
     /// App 冷启动时能解除「只靠地磁不报」的外部先验都会标 externalPriorApplied：
     /// 蓝牙粗定位（applyPositionPrior）、标签范围（applyTagRanges）、贴近标签 / 货架标识牌（applyRegion）。
     func testLiveColdStartPriorsLiftSuppression() {
