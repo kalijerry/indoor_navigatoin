@@ -26,6 +26,12 @@ public struct EvalReport: Codable {
     public var errorsCm: [Double] = []
     /// 参考轨迹上的点数（含没定到位的），算「定位覆盖率」
     public var refPoints: Int = 0
+    /// 和 errorsCm 一一对应：报的 1σ 不确定度（cm；−1 = 没报），量不确定度标定
+    public var uncertaintiesCm: [Double] = []
+    /// 相邻两个有把握的打分点之间估计 / 参考走过的路（cm）和估计跳 > 3 m 的次数（见 `LocalizationEvaluator`），量跳点 / 来回抖
+    public var estPathCm: Double = 0
+    public var refPathFixCm: Double = 0
+    public var bigJumps: Int = 0
 
     public var line: String {
         func f(_ v: Double?) -> String { v.map { String(format: "%.0f", $0) } ?? "—" }
@@ -195,7 +201,24 @@ public enum SessionEvaluator {
         public var frozen = false
         /// 纯推算位置（`.pdrIMU`：惯导引擎的输出，已知起点时从真值起点、起步朝向出发；诊断用）
         public var odometry: Point2? = nil
+        /// 滤波器报的置信度（诊断用）
+        public var confidence: Double? = nil
+        /// 诊断（`SessionEvaluator.trackDiagnostics` 打开时才算，每拍多扫一遍粒子）：全部粒子的位置散布（cm）、
+        /// 航向偏差的圆周标准差（度）、步长比例的加权中位数 / 标准差
+        public var spreadCm: Double? = nil
+        public var headingSpreadDeg: Double? = nil
+        public var scaleMedian: Double? = nil
+        public var scaleSigma: Double? = nil
+        /// 航向偏差的加权直方图（12 格，−180°…180°）
+        public var headingHistogram: [Double]? = nil
+        /// 全部粒子相对报的位置的加权 RMS 距离（cm）
+        public var spreadAroundEstimateCm: Double? = nil
+        /// 全部粒子的加权平均位置
+        public var particleMean: Point2? = nil
     }
+
+    /// 逐点轨迹里带上粒子散布等诊断量（hpass-eval --diag-out）。默认关：每拍要多扫一遍粒子
+    nonisolated(unsafe) public static var trackDiagnostics = false
 
     /// `.pdrIMU` 回放用的惯导引擎：App 实时定位页同一份配置（`FusionEngine.live`，罗盘关），**不带通道约束**
     /// （输出只当增量送粒子滤波，见 `FusionConfig.live`）。
@@ -323,9 +346,21 @@ public enum SessionEvaluator {
         func track(_ t: Int64, odometry: Point2? = nil) {
             guard let cb = onTrack, let r = refAt(t) else { return }
             let e = sh.estimate
-            cb(TrackPoint(tMs: t, estimate: e?.position, converged: e?.converged ?? false,
-                          uncertaintyCm: e?.uncertaintyCm, reference: r, roomId: e?.roomId, roomMass: e?.roomMass ?? 0,
-                          carryMode: fusion?.carryMode ?? .unknown, frozen: sh.localizer.stationaryFrozen, odometry: odometry))
+            var tp = TrackPoint(tMs: t, estimate: e?.position, converged: e?.converged ?? false,
+                                uncertaintyCm: e?.uncertaintyCm, reference: r, roomId: e?.roomId, roomMass: e?.roomMass ?? 0,
+                                carryMode: fusion?.carryMode ?? .unknown, frozen: sh.localizer.stationaryFrozen, odometry: odometry)
+            tp.confidence = e?.confidence
+            if Self.trackDiagnostics {
+                let ws = sh.localizer.weightedSpread(), ss = sh.localizer.scaleStatistics()
+                tp.spreadCm = ws.spreadCm
+                tp.particleMean = ws.mean
+                tp.headingSpreadDeg = ws.headingSpreadDeg
+                tp.scaleMedian = ss.median
+                tp.scaleSigma = ss.sigma
+                tp.headingHistogram = sh.localizer.headingBiasHistogram(bins: 12)
+                if let p = e?.position { tp.spreadAroundEstimateCm = sh.localizer.weightedSpread(around: p) }
+            }
+            cb(tp)
         }
         var lastFused: Point2?
         for (_, _, e) in evs {
@@ -376,6 +411,10 @@ public enum SessionEvaluator {
                           inMapShare: refTotal > 0 ? Double(refInMap) / Double(refTotal) : nil)
         rep.errorsCm = ev.errors
         rep.refPoints = refTotal
+        rep.uncertaintiesCm = ev.uncertainties
+        rep.estPathCm = ev.estPathCm
+        rep.refPathFixCm = ev.refPathFixCm
+        rep.bigJumps = ev.bigJumps
         return rep
     }
 

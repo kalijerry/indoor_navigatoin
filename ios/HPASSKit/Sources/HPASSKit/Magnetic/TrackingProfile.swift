@@ -114,6 +114,8 @@ public extension MagneticConfig {
         c.lostConfidence = TrackingProfile.lostConfidence
         c.lostConfidenceWithExternalPrior = TrackingProfile.lostConfidenceWithExternalPrior
         c.bleSoftTracking = true
+        // 报的不确定度用误差模型（ReportedUncertainty），不用簇内散布（太自信）
+        c.honestUncertainty = true
         return c
     }
 
@@ -136,6 +138,7 @@ public extension MagneticConfig {
             scaleWalkPerM = 0.003
             // 推算本身已经很准（公开数据集：中位 0.3 m），地磁只做很小的修正
             convergedMagWeight = pinnedConvergedMagWeight ?? 0.1
+            reportScaleSigma = ReportedUncertainty.vioScaleSigma
         case .pdr:
             // 起始朝向来自「面朝下一个点位」/ 在屏幕上指，比视觉里程计粗：8～10°
             initialHeadingBiasSigmaDeg = trackingHeadingKnown ? 10 : 30
@@ -149,6 +152,7 @@ public extension MagneticConfig {
             initialScaleSigma = d.initialScaleSigma
             scaleWalkPerM = d.scaleWalkPerM
             convergedMagWeight = pinnedConvergedMagWeight ?? 0.2
+            reportScaleSigma = ReportedUncertainty.pdrScaleSigma
         }
     }
 }
@@ -183,6 +187,9 @@ public extension MagneticConfig {
         }
         // 每次读数的整体水平会差 10～16 µT（磁力计偏置估计不同）：没定到按起伏找，定到后估出偏移再按绝对值比
         c.hybridOffset = true
+        // 报的不确定度用误差模型（ReportedUncertainty），不用簇内散布（太自信）
+        c.honestUncertainty = true
+        c.reportScaleSigma = visualOdometry ? ReportedUncertainty.vioScaleSigma : ReportedUncertainty.pdrScaleSigma
         c.magOnlyColdStartReports = magOnlyColdStartAllowed(mapAreaM2: mapAreaM2)
         if magOnlyColdStartAllowed(mapAreaM2: mapAreaM2) {
             c.coldStartParticleCount = SmallMapColdStart.particleCount

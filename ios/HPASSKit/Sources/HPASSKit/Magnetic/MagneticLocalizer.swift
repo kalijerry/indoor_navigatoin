@@ -214,6 +214,13 @@ public struct MagneticConfig {
     /// 挑战者搜索时的粒子数（nil = 同 `coldStartParticleCount`）
     public var coldChallengerParticleCount: Int?
 
+    /// 报的不确定度（`MagneticEstimate.uncertaintyCm`）用误差模型（`ReportedUncertainty`：全部粒子相对报的位置的散布，
+    /// 加上粒子步长比例散布塌缩后补回的那部分推算误差），不用簇内散布。只改报的数，位置、收敛 / 丢失判定都不变
+    /// （内部照旧用簇内散布，见 `MagneticEstimate.clusterUncertaintyCm`）。false = 原有行为。跟踪档、实时冷启动档打开
+    public var honestUncertainty = false
+    /// 误差模型里「这次推算的步长比例真实有多不准」（1σ，见 `ReportedUncertainty`）：计步 0.10、视觉里程计 0.02，配置档按运动来源给
+    public var reportScaleSigma: Double = ReportedUncertainty.pdrScaleSigma
+
     /// 跟踪配置档的运动来源（nil = 不是跟踪档）。运动来源中途变了（视觉里程计没对齐 / 跟丢时计步顶上）
     /// 用 `MagneticLocalizer.setOdometry` 换成对应那一套参数。
     public var trackingOdometry: OdometrySource?
@@ -288,7 +295,8 @@ public enum ColdStartGate {
 public struct MagneticEstimate {
     /// 位置，cm，地图系。
     public var position: Point2
-    /// 最重粒子簇的 1σ 位置不确定度（cm）。
+    /// 报的 1σ 位置不确定度（cm，均方根半径 √(σx² + σy²)）。`MagneticConfig.honestUncertainty` 打开时是误差模型
+    /// （`ReportedUncertainty`），否则是最重粒子簇的簇内散布（原有行为）。
     public var uncertaintyCm: Double
     /// 0...1。簇内权重占比 × (1 − 不确定度 / 参考尺度)。
     public var confidence: Double
@@ -307,6 +315,33 @@ public struct MagneticEstimate {
     /// 权重第二多的房间和它的权重占比（两个房间势均力敌时界面可以都提）
     public var roomRunnerUpId: String? = nil
     public var roomRunnerUpMass: Double = 0
+    /// 最重粒子簇的簇内散布（cm，收敛 / 丢失判定用的那个数；nil = 和 uncertaintyCm 相同）
+    public var clusterUncertaintyCm: Double? = nil
+}
+
+/// 报的不确定度的误差模型（`MagneticConfig.honestUncertainty`）。
+///
+/// 簇内散布当 1σ 太自信（Lab：真实计步跟踪 误差 / 1σ 的中位 2.4，自采办公室留一法 1.2、门店 3.8～5，二维高斯应是 0.83）：
+/// 1. 簇半径 2.5 m 截断：簇内散布最大也就 1.5～1.8 m，多峰时其余的峰不算；
+/// 2. 粒子的步长比例散布会塌：通道 / 墙把「走得太远」的粒子不断挡掉、重采样，步长比例的加权标准差从先验的 0.06
+///    掉到 0.01～0.03，粒子云沿走向的散布跟着变窄——但滤波器其实学不到步长（真实步长比例偏 1 的 0.1～0.2 在先验 2σ 外），
+///    塌了的时候误差反而最大（开发集：步长散布 < 0.04 的点误差中位 5～10 m，簇内散布才 0.5～1 m）。
+/// 所以报的 1σ² = 全部粒子相对报的位置的均方距离 + (√(σ_真² − σ_粒子²)₊ · min(L, 地图外框边长))²：
+/// σ_真 = 这次推算的步长比例真实有多不准（`MagneticConfig.reportScaleSigma`：计步 0.10 = 实测同一台 iPhone 各次的离散，
+/// 设备之间的偏差 0.84～1.18 更大；视觉里程计 0.02），σ_粒子 = 粒子步长比例的加权标准差，
+/// L = 上一次定位依据（已知起点、收敛、换成挑战者）之后走过的推算路程。粒子还留着这么大的步长散布时第二项为 0（散布本身就诚实）；
+/// 塌了多少就补回多少。地图外框边长封顶：误差不会比场地还大，小房间里墙不断把沿走向的误差「卡」回去。
+/// 标定只用开发集（公开 ILC 建图会话两折交叉的真实计步回放、另一套种子的合成办公室 / 两间房 / 冷启动），不用 Lab 打分的测试会话：
+/// 开发集 误差 / 1σ 的中位（目标 0.83，见 docs/lab-ci.md），σ_真 = 0.08 / 0.10 / 0.12：真实计步 1.22 / 1.08 / 0.98、
+/// 合成办公室 1.15 / 0.92 / 0.78、合成办公室冷启动 1.25 / 1.16 / 1.09；封顶改成 0.5 / 2 倍边长时差别不大（办公室 1.3 / 0.6 是两头）。
+/// 合成的「无偏」漂移（public/pdr、public/vio：起点就是真值、尺度误差零均值）本来就偏保守（0.3～0.7），这里只会更保守。
+/// 计算量：每次对外报位置（step / estimate()）多扫一遍粒子（N 次 exp，和找簇的那一遍同量级，远小于似然更新；
+/// 内部的收敛 / 丢失判定、挑战者比较不算这个数）。
+public enum ReportedUncertainty {
+    /// 计步的步长比例真实离散（1σ）
+    public static let pdrScaleSigma: Double = 0.10
+    /// 视觉里程计的尺度离散（1σ）
+    public static let vioScaleSigma: Double = 0.02
 }
 
 /// 可复现的随机数（测试要求结果稳定）。
@@ -575,6 +610,7 @@ public final class MagneticLocalizer {
     public func reset(start: Point2?, spreadCm: Double = 150, headingUnknown: Bool = false, priorFraction: Double = 0,
                       walkableTries: Int = 0) {
         pathSinceResetCm = start == nil ? 0 : 3000     // 已知起点：不用等走够路
+        sinceFixCm = 0
         stationaryFrozen = false
         frozenBuffer.removeAll()
         recentTotals = []
@@ -656,6 +692,8 @@ public final class MagneticLocalizer {
     public private(set) var magneticWeight = 1.0
     public private(set) var magWeightFactors: (coverage: Double, path: Double, info: Double, agree: Double) = (1, 1, 1, 1)
     private var pathSinceResetCm = 0.0
+    /// 上一次定位依据（reset 给了起点、收敛、换成挑战者）之后走过的推算路程（cm），报的不确定度用（见 `ReportedUncertainty`）
+    public private(set) var sinceFixCm = 0.0
     private var recentTotals: [Double] = []
     private var weightUpdates = 0
 
@@ -760,6 +798,23 @@ public final class MagneticLocalizer {
         // 圆周标准差 √(−2 ln R)，R = 平均合向量长度
         let r = min(max((sc * sc + ss * ss).squareRoot() / sw, 1e-12), 1)
         return (m, (v / sw).squareRoot(), (-2 * log(r)).squareRoot() * 180 / Double.pi)
+    }
+
+    /// 航向偏差的加权直方图（整圆分 `bins` 格，第 k 格 = [−180° + k·360°/bins, …)，和为 1）。诊断用（hpass-eval --diag-out）
+    public func headingBiasHistogram(bins: Int = 12) -> [Double] {
+        let nb = max(bins, 1)
+        var h = [Double](repeating: 0, count: nb)
+        guard !xs.isEmpty else { return h }
+        let mx = logw.max() ?? 0
+        var tot = 0.0
+        for i in xs.indices {
+            let w = exp(logw[i] - mx)
+            var a = bias[i].truncatingRemainder(dividingBy: 2 * Double.pi)
+            if a < -Double.pi { a += 2 * Double.pi } else if a >= Double.pi { a -= 2 * Double.pi }
+            h[min(Int((a + Double.pi) / (2 * Double.pi) * Double(nb)), nb - 1)] += w
+            tot += w
+        }
+        return tot > 0 ? h.map { $0 / tot } : h
     }
 
     /// 标签范围约束：每片听到的标签都要求「人在它 rangeCm 以内」（按信号强弱定，实测 P90：−75 dBm 2.5 m、
@@ -881,6 +936,7 @@ public final class MagneticLocalizer {
         }
 
         travelledCm += dist
+        sinceFixCm += dist
         if let f = feature {
             let t = min(max(trust, 0), 1)
             featureSum = featureSum + f * t
@@ -1192,12 +1248,13 @@ public final class MagneticLocalizer {
     /// - 没收敛：连续几次更新都落在一个小簇里就算收敛，冷启动时同时把粒子数缩到 `particleCount`；
     /// - 已收敛：置信度持续很低（走进没采过的地方、磁场对不上）就算丢失，`converged` 变回 false。
     private func checkConvergence() {
-        let e = estimate()
+        let e = estimate(reportingUncertainty: false)
         // 簇中心应当按实际走的方向和距离移动；凑巧在别处匹配上的「簇」会忽东忽西，不算
         let consistent = lastCenter.map { ($0 + motionSinceUpdate).distance(to: e.position) <= 100 } ?? false
         lastCenter = e.position
         motionSinceUpdate = .zero
-        let good = e.uncertaintyCm <= config.convergedUncertaintyCm && e.confidence >= config.convergedConfidence
+        let unc = e.clusterUncertaintyCm ?? e.uncertaintyCm
+        let good = unc <= config.convergedUncertaintyCm && e.confidence >= config.convergedConfidence
             && !convergenceBlocked
         if !hasConverged {
             if magOnlyColdStartSuppressed { convergedStreak = 0; return }
@@ -1207,13 +1264,14 @@ public final class MagneticLocalizer {
             if convergedStreak >= (gated ? max(config.coldMinStreak, 1) : 3) {
                 hasConverged = true
                 lowStreak = 0
+                sinceFixCm = 0
                 if coldStart && xs.count > config.particleCount { resample(to: config.particleCount) }
             }
             return
         }
         if holdingAgainstFar { return }       // 远跳确认期间：丢失计数不动（远跳要么确认、要么原来的簇恢复）
         if lostSuppressRemainingCm > 0 { lowStreak = 0; return }   // 携带模式刚重撒：航向整圆撒开后置信度必然先掉，不算丢
-        let bad = e.confidence < effectiveLostConfidence || e.uncertaintyCm > config.lostUncertaintyCm
+        let bad = e.confidence < effectiveLostConfidence || unc > config.lostUncertaintyCm
         lowStreak = bad ? lowStreak + 1 : 0
         if lowStreak >= config.lostUpdates { loseTrack() }
     }
@@ -1332,7 +1390,7 @@ public final class MagneticLocalizer {
         let cu = ch.updateCount
         ch.step(delta: delta, feature: feature, trust: trust)
         guard ch.hasConverged else { duelLogRatio = 0; duelUpdates = 0; return }
-        if ch.estimate().position.distance(to: estimate().position) <= config.coldChallengerSeparationCm {
+        if ch.estimate(reportingUncertainty: false).position.distance(to: estimate(reportingUncertainty: false).position) <= config.coldChallengerSeparationCm {
             spawnChallenger()           // 印证了主滤波器：重新从零搜
             return
         }
@@ -1362,6 +1420,7 @@ public final class MagneticLocalizer {
         meanMotion = o.meanMotion
         lastEffectiveRatio = o.lastEffectiveRatio
         recentTotals = o.recentTotals
+        sinceFixCm = o.sinceFixCm
         switchStreak = 0
         holdingAgainstFar = false
         lowStreak = 0
@@ -1550,14 +1609,19 @@ public final class MagneticLocalizer {
         return (Point2(cx, cy), m, unc)
     }
 
-    public func estimate() -> MagneticEstimate {
+    public func estimate() -> MagneticEstimate { estimate(reportingUncertainty: true) }
+
+    /// reportingUncertainty = false：内部只要位置 / 簇内散布（收敛判定、挑战者比较、房间兜底），不多扫一遍粒子算报的不确定度
+    func estimate(reportingUncertainty: Bool) -> MagneticEstimate {
         let c = cluster(from: hasConverged ? committed : nil)
         var conf = max(0, min(1, c.mass * (1 - c.unc / config.confidenceScaleCm)))
         // 估计点本身落在没有磁场数据的地方：地磁说了不算，置信度归零
         // （跟踪配置档关掉：没采过的地方本来就该纯推算，不算丢）
         if config.zeroConfidenceOffMap && field.sample(at: c.center) == nil { conf = 0 }
-        var e = MagneticEstimate(position: c.center, uncertaintyCm: c.unc, confidence: conf,
-                                 effectiveRatio: lastEffectiveRatio, updates: updateCount, converged: hasConverged)
+        var e = MagneticEstimate(position: c.center,
+                                 uncertaintyCm: config.honestUncertainty && reportingUncertainty ? reportedUncertainty(at: c.center, clusterUnc: c.unc) : c.unc,
+                                 confidence: conf, effectiveRatio: lastEffectiveRatio, updates: updateCount, converged: hasConverged)
+        e.clusterUncertaintyCm = c.unc
         // 房间：所有房间的权重一次算完，报权重最多的房间（不是加权平均点所在的房间——粒子分在两个房间时，
         // 平均点可能落在中间的走廊或离错的房间更近，正好是房间级兜底要管的情况）
         if config.reportRoom, let g = walkable?.rooms {
@@ -1571,6 +1635,24 @@ public final class MagneticLocalizer {
             }
         }
         return e
+    }
+
+    /// 报的 1σ（cm，见 `ReportedUncertainty`）：√(全部粒子相对 p 的均方距离 + (步长散布缺口 · min(L, 地图边长))²)，不小于簇内散布
+    func reportedUncertainty(at p: Point2, clusterUnc: Double) -> Double {
+        guard !xs.isEmpty else { return clusterUnc }
+        let mx = logw.max() ?? 0
+        var sw = 0.0, s2 = 0.0, m1 = 0.0, m2 = 0.0
+        for i in xs.indices {
+            let w = exp(logw[i] - mx)
+            let dx = xs[i] - p.x, dy = ys[i] - p.y
+            sw += w; s2 += w * (dx * dx + dy * dy); m1 += w * scale[i]; m2 += w * scale[i] * scale[i]
+        }
+        guard sw > 0, sw.isFinite else { return clusterUnc }
+        let mean = m1 / sw
+        let particleVar = max(m2 / sw - mean * mean, 0)
+        let lever = min(sinceFixCm, (field.widthCm * field.heightCm).squareRoot())
+        let model = max(config.reportScaleSigma * config.reportScaleSigma - particleVar, 0).squareRoot() * lever
+        return max(clusterUnc, (s2 / sw + model * model).squareRoot())
     }
 
     /// 每个房间的粒子权重占比（下标 = 房间编号；不在任何房间的粒子不计入任何房间，但计入总权重）
@@ -1635,7 +1717,7 @@ public final class MagneticLocalizer {
     /// 没有房间图时全部用估计点
     private func roomCenters() -> [Point2] {
         guard let g = walkable?.rooms else {
-            let c = estimate().position
+            let c = estimate(reportingUncertainty: false).position
             return [Point2](repeating: c, count: xs.count)
         }
         let none = g.rooms.count
@@ -1654,7 +1736,7 @@ public final class MagneticLocalizer {
         }
         var cs = [Point2](repeating: .zero, count: none + 1)
         // 不在任何房间格里的粒子（门洞、墙缝）向估计点收拢
-        cs[none] = estimate().position
+        cs[none] = estimate(reportingUncertainty: false).position
         for r in cs.indices where sw[r] > 0 && r != none {
             let c = Point2(sx[r] / sw[r], sy[r] / sw[r])
             let ok = (walkable?.isWalkable(c) ?? true) && (r == none || g.roomIndex(at: c) == r)

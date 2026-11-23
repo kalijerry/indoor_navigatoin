@@ -152,6 +152,10 @@ do {
     let trackOut = arg("--track-out")
     // --odo-out：诊断用，--motion pdr-imu 时每个运动节拍一行纯推算位置（惯导引擎输出）+ 参考 + 滤波估计
     let odoOut = arg("--odo-out")
+    // --diag-out：诊断用，每个运动节拍一行估计 + 参考 + 置信度 + 粒子散布 / 航向散布 / 步长比例（每拍多扫一遍粒子，只给诊断）
+    let diagOut = arg("--diag-out")
+    if diagOut != nil { SessionEvaluator.trackDiagnostics = true }
+    var diagLines = ["session,run,t_ms,est_x,est_y,converged,unc_cm,ref_x,ref_y,confidence,spread_cm,heading_spread_deg,scale_median,scale_sigma,odo_x,odo_y,heading_hist,spread_est_cm,mean_x,mean_y"]
     var odoLines = ["session,run,t_ms,odo_x,odo_y,ref_x,ref_y,est_x,est_y,converged,unc_cm"]
     var trackLines = ["session,run,t_ms,est_x,est_y,converged,unc_cm,ref_x,ref_y,room_id,room_mass,carry_mode,frozen"]
     let carryMotion = CommandLine.arguments.contains("--carry-motion")
@@ -194,6 +198,7 @@ do {
                 if let v = arg("--conv-pos-noise").flatMap(Double.init) { cfg.convergedPositionNoiseFraction = v }
                 if let v = arg("--particles").flatMap(Int.init) { cfg.particleCount = v }
                 if let v = arg("--jump-confirm").flatMap(Int.init) { cfg.jumpConfirmUpdates = v }
+                if let v = arg("--keep-near").flatMap(Int.init) { cfg.keepClusterRequiresNear = v != 0 }
                 if let v = arg("--blocked-penalty").flatMap(Double.init) { cfg.blockedPenalty = v }
                 if CommandLine.arguments.contains("--hard-ble-tracking") { cfg.bleSoftTracking = false }
                 if CommandLine.arguments.contains("--ble-soft-no-recover") { cfg.bleSoftLocalRecovery = false }
@@ -221,8 +226,17 @@ do {
                                                   coldStartGate: CommandLine.arguments.contains("--cold-gate"),
                                                   wifi: useWiFi ? built.wifi : nil, motion: motion, startHeading: startHeading,
                                                   carryMotion: carryMotion, stationaryFreeze: stationaryFreeze,
-                                                  onTrack: trackOut == nil && odoOut == nil ? nil : { p in
+                                                  onTrack: trackOut == nil && odoOut == nil && diagOut == nil ? nil : { p in
                 func f1(_ v: Double?) -> String { v.map { String(format: "%.1f", $0) } ?? "" }
+                func f3(_ v: Double?) -> String { v.map { String(format: "%.3f", $0) } ?? "" }
+                if diagOut != nil {
+                    diagLines.append("\(t.lastPathComponent),\(k + 1),\(p.tMs),\(f1(p.estimate?.x)),\(f1(p.estimate?.y)),\(p.converged ? 1 : 0),"
+                                     + "\(f1(p.uncertaintyCm.flatMap { $0.isFinite ? $0 : nil })),\(f1(p.reference.x)),\(f1(p.reference.y)),"
+                                     + "\(f3(p.confidence)),\(f1(p.spreadCm.flatMap { $0.isFinite ? $0 : nil })),\(f1(p.headingSpreadDeg)),"
+                                     + "\(f3(p.scaleMedian)),\(f3(p.scaleSigma)),\(f1(p.odometry?.x)),\(f1(p.odometry?.y)),"
+                                     + (p.headingHistogram ?? []).map { String(format: "%.2f", $0) }.joined(separator: ";")
+                                     + ",\(f1(p.spreadAroundEstimateCm)),\(f1(p.particleMean?.x)),\(f1(p.particleMean?.y))")
+                }
                 if odoOut != nil, let o = p.odometry {
                     odoLines.append("\(t.lastPathComponent),\(k + 1),\(p.tMs),\(f1(o.x)),\(f1(o.y)),\(f1(p.reference.x)),\(f1(p.reference.y)),"
                                     + "\(f1(p.estimate?.x)),\(f1(p.estimate?.y)),\(p.converged ? 1 : 0),\(f1(p.uncertaintyCm.flatMap { $0.isFinite ? $0 : nil }))")
@@ -260,6 +274,15 @@ do {
                          100 * Double(errs.filter { $0 <= 200 }.count) / Double(errs.count),
                          refN > 0 ? 100 * Double(errs.count) / Double(refN) : 0,
                          ff.isEmpty ? "—" : String(format: "%.1f m", q(ff, 0.5)), ff.count, out.count))
+            // 不确定度标定（报的 1σ 是均方根半径：二维高斯时 误差 / 1σ 的中位 0.83、63% 落在 1σ 内、98% 在 2σ 内）和跳点
+            let ratios = zip(out.flatMap(\.errorsCm), out.flatMap(\.uncertaintiesCm)).compactMap { $1 > 0 ? $0 / $1 : nil }.sorted()
+            let estP = out.reduce(0) { $0 + $1.estPathCm }, refP = out.reduce(0) { $0 + $1.refPathFixCm }
+            if !ratios.isEmpty {
+                print(String(format: "【稳健】误差/不确定度 中位 %.2f  1σ 内 %.0f%%  2σ 内 %.0f%%  轨迹长度比 %.2f  跳 >3 m %.2f 次/100 m",
+                             q(ratios, 0.5), 100 * Double(ratios.filter { $0 <= 1 }.count) / Double(ratios.count),
+                             100 * Double(ratios.filter { $0 <= 2 }.count) / Double(ratios.count),
+                             refP > 0 ? estP / refP : 0, refP > 0 ? Double(out.reduce(0) { $0 + $1.bigJumps }) / (refP / 10_000) : 0))
+            }
         } else { print("【汇总】没有任何定位结果") }
     }
     let all = out.compactMap(\.medianCm)
@@ -267,6 +290,10 @@ do {
     if let p = odoOut {
         try (odoLines.joined(separator: "\n") + "\n").write(toFile: p, atomically: true, encoding: .utf8)
         print("纯推算轨迹已写到 \(p)（\(odoLines.count - 1) 行）")
+    }
+    if let p = diagOut {
+        try (diagLines.joined(separator: "\n") + "\n").write(toFile: p, atomically: true, encoding: .utf8)
+        print("诊断轨迹已写到 \(p)（\(diagLines.count - 1) 行）")
     }
     if let p = trackOut {
         try (trackLines.joined(separator: "\n") + "\n").write(toFile: p, atomically: true, encoding: .utf8)

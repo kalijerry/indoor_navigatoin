@@ -208,11 +208,22 @@ public final class ShadowLocalizer {
 /// 地磁定位精度统计：参考轨迹（采集时 ARKit + 贴通道）和地磁定位的位置比。
 public final class LocalizationEvaluator {
     public private(set) var errors: [Double] = []
+    /// 和 `errors` 一一对应：报的 1σ 不确定度（cm，`MagneticEstimate.uncertaintyCm`；不是有限正数时记 −1 = 没报）。
+    /// 量不确定度标定得诚不诚实（误差 / 不确定度的中位、落在 1σ / 2σ 以内的比例）
+    public private(set) var uncertainties: [Double] = []
     public private(set) var firstFixPathCm: Double?
     public private(set) var jumps = 0
     public private(set) var pathCm = 0.0
+    /// 跳点 / 来回抖：相邻两个有把握的打分点之间，估计走过的路（Σ|Δ估计|）和参考走过的路（Σ|Δ参考|）；
+    /// 两者之比 = 报的轨迹比真实轨迹长多少倍（1 = 不抖）
+    public private(set) var estPathCm = 0.0
+    public private(set) var refPathFixCm = 0.0
+    /// 相邻两个有把握的打分点之间估计挪动超过 `bigJumpCm` 的次数（每次打分只走约 20 cm，挪这么远就是跳）
+    public private(set) var bigJumps = 0
+    public static let bigJumpCm = 300.0
     private var lastRef: Point2?
     private var lastEst: Point2?
+    private var lastFixRef: Point2?
 
     public init() {}
 
@@ -220,11 +231,19 @@ public final class LocalizationEvaluator {
     public func add(estimate e: MagneticEstimate, reference r: Point2) {
         if let l = lastRef { pathCm += r.distance(to: l) }
         lastRef = r
-        guard e.converged else { lastEst = nil; return }
+        guard e.converged else { lastEst = nil; lastFixRef = nil; return }
         if firstFixPathCm == nil { firstFixPathCm = pathCm }
-        if let le = lastEst, e.position.distance(to: le) > 200 { jumps += 1 }
+        if let le = lastEst {
+            let d = e.position.distance(to: le)
+            if d > 200 { jumps += 1 }
+            if d > Self.bigJumpCm { bigJumps += 1 }
+            estPathCm += d
+            if let lr = lastFixRef { refPathFixCm += r.distance(to: lr) }
+        }
         lastEst = e.position
+        lastFixRef = r
         errors.append(e.position.distance(to: r))
+        uncertainties.append(e.uncertaintyCm.isFinite && e.uncertaintyCm > 0 ? e.uncertaintyCm : -1)
     }
 
     public func percentile(_ q: Double) -> Double? {

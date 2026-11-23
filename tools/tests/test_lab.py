@@ -35,6 +35,28 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(m["coverage"], 0)
         self.assertEqual(m["fixed_share"], 0)
 
+    def test_robustness_metrics(self):
+        r = rep([50, 100, 300, 900], ref=4)
+        r.update({"uncertaintiesCm": [100, 100, 100, -1], "estPathCm": 600.0, "refPathFixCm": 400.0, "bigJumps": 1})
+        m = lab.metrics([r])
+        # 误差 / 1σ：0.5、1、3（第四个点没报不确定度，不算）
+        self.assertEqual(m["unc_ratio_p50"], 1.0)
+        self.assertAlmostEqual(m["within_1sigma"], 2 / 3, places=3)
+        self.assertAlmostEqual(m["within_2sigma"], 2 / 3, places=3)
+        self.assertEqual(m["path_ratio"], 1.5)
+        self.assertEqual(m["jumps3m_per_100m"], 25.0)     # 1 次 / 4 m 参考路程
+
+    def test_robustness_absent_in_old_reports(self):
+        m = lab.metrics([rep([100, 200])])
+        for k in ("unc_ratio_p50", "within_1sigma", "within_2sigma", "path_ratio", "jumps3m_per_100m"):
+            self.assertIsNone(m[k])
+
+    def test_robustness_is_not_a_gate(self):
+        base = {"median_cm": 300, "p90_cm": 800, "wrong_fix": 0.2, "coverage": 0.8, "fixed_share": 1.0,
+                "unc_ratio_p50": 0.8, "path_ratio": 1.1}
+        c = lab.compare(dict(base, unc_ratio_p50=3.0, path_ratio=2.5), base, SUITE["tolerance"])
+        self.assertFalse(c["regressions"])
+
     def test_ladder(self):
         ladder = SUITE["ladder"]
         self.assertEqual(lab.ladder_level({"median_cm": 120, "p90_cm": 250, "wrong_fix": 0.02, "coverage": 0.9}, ladder),
