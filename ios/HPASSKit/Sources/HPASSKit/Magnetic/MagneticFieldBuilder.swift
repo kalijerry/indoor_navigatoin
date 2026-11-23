@@ -282,7 +282,9 @@ extension MagneticFieldMap {
                 return [round3(f.total), round3(f.vertical), round3(f.horizontal)] as [Double]
             }
         }
-        return ["cellCm": cellCm, "cols": cols, "rows": rows, "cells": enc(cells), "sigma": enc(sigmas)]
+        var o: [String: Any] = ["cellCm": cellCm, "cols": cols, "rows": rows, "cells": enc(cells), "sigma": enc(sigmas)]
+        if let t = trackingTemperature { o["trackingTemperature"] = (t * 100).rounded() / 100 }
+        return o
     }
 
     private func round3(_ v: Double) -> Double { (v * 1000).rounded() / 1000 }

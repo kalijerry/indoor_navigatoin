@@ -9,7 +9,8 @@ final class MapPackageTests: XCTestCase {
         for x in stride(from: 0.0, to: 2000, by: 10) {
             for _ in 0..<6 { _ = b.add(position: Point2(x, 250), feature: MagneticFeature(total: 50 + sin(x / 100), vertical: -38.25, horizontal: 31)) }
         }
-        let field = b.build()
+        var field = b.build()
+        field.trackingTemperature = 3.25
         let ble = BLEFingerprintMap(cellCm: 200, cells: [], tags: ["88-A7-20-91": .init(x: 123.5, y: 456.25, maxRssi: -61, samples: 12)])
         let mapJSON = Data(#"{"width":2000,"height":500,"mapElementList":[]}"#.utf8)
         let meta = MapPackage.Meta(id: "store_x", name: "测试场地", kind: "store", version: 1791361225163, source: "2 个会话")
@@ -21,6 +22,9 @@ final class MapPackageTests: XCTestCase {
         XCTAssertEqual(c.mapJSON, mapJSON)
         XCTAssertEqual(c.worldMap, Data([1, 2, 3]))
         XCTAssertEqual(c.field?.coveredCells, field.coveredCells)
+        // 跟踪似然标定放在说明里，解包后回到磁场图上
+        XCTAssertEqual(c.meta.trackingTemperature, 3.25)
+        XCTAssertEqual(c.field?.trackingTemperature, 3.25)
         let p = Point2(725, 250)
         XCTAssertEqual(c.field!.sample(at: p)!.mean.total, field.sample(at: p)!.mean.total, accuracy: 0.01)
         XCTAssertEqual(c.field!.sample(at: p)!.mean.vertical, -38.25, accuracy: 0.01)

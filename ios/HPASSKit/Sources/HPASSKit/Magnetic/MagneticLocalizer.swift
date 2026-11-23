@@ -80,6 +80,25 @@ public struct MagneticConfig {
     /// （地图误差、偏移误差都是成片的），走这么远才算一次独立观测。地磁似然再除以 max(1, 相关长度 / updateDistanceCm)。
     /// 只作用于地磁，不影响横向距离等其他观测。0 = 原有行为（每次更新都当独立的）。
     public var magneticCorrelationCm: Double = 0
+    /// 每个粒子自己估整体偏移（Rao-Blackwell）：「读数 − 粒子处地图」= 偏移 b + 白噪声，b 沿路随机游走，
+    /// 每个粒子带一个 b 的估计（三个分量），方差 P 全体共用（只取决于更新节拍）。似然看新息 ν = 残差 − b̂（t4，方差 P + q + R + 格子方差），
+    /// 再用 ν 更新 b̂（卡尔曼增益，|ν| 截到 3σ）。打开后：不用全局偏移（hybridOffset 的预热 / 中位数）、不按相关长度折算、
+    /// 不乘 `convergedMagWeight`（配置档钉死的除外），强度只由温度定。false = 原有行为（地图标定过时见 `particleOffsetFromMap`）。
+    /// 为什么：实测残差（扣会话整体偏移后）沿路高度相关、慢慢漂（相邻 50 cm 相关 0.94～0.96），原来按「每 12 次更新算一次独立观测」
+    /// 整体打折，地图很准时（合成小场地）也只用到百分之一的信息；偏移随机游走把慢漂的部分吸收掉，只用局部的起伏比，
+    /// 不用打那么大的折。
+    public var particleOffsetFilter = false
+    /// 计步跟踪时，地图带了跟踪似然标定（`MagneticFieldMap.trackingTemperature` ≤ `TrackingCalibration.maxTemperature`）
+    /// 就自动用「每个粒子自己估偏移」，温度取地图标定的值。只在跟踪档、运动来源是计步、地磁权重没被配置档钉死时；
+    /// 视觉里程计（推算本来就准）、冷启动、没标定的图照旧。
+    public var particleOffsetFromMap = false
+    /// 偏移随机游走每次更新（`updateDistanceCm`）的方差 q（µT²），按实际走过的距离折算
+    public var particleOffsetWalkVarUT2: Double = 16
+    /// 白噪声方差 R（µT²），和格子方差相加
+    public var particleOffsetWhiteVarUT2: Double = 9
+    /// 对数似然除以的温度（含特征之间的相关；不再乘 `likelihoodTemperature`、不按相关长度折算）。
+    /// 只给 `particleOffsetFilter` 用；`particleOffsetFromMap` 用地图标定的温度
+    public var particleOffsetTemperature: Double = 2.4
     /// 粒子所在位置没有地图数据时的对数似然惩罚。要比「在对的地方但读数有点对不上」重得多，
     /// 否则粒子会跑到没采集过的地方去（实测：−4 时估计会跳到一百多米外）。
     public var missingDataPenalty: Double = -20
@@ -382,6 +401,19 @@ public final class MagneticLocalizer {
     private var logw: [Double] = []
     /// 起伏模式：每个粒子沿自己走过的路，地图值的指数平均；读数的指数平均（NaN = 还没有）
     private var ema0: [Double] = [], ema1: [Double] = [], ema2: [Double] = []
+    /// 每个粒子自己的偏移估计（`particleOffsetFilter`；NaN = 还没有），和共用的方差 P（nil = 还没开始）
+    private var off0: [Double] = [], off1: [Double] = [], off2: [Double] = []
+    private var offP: (Double, Double, Double)?
+    /// 上一次更新有没有用「每个粒子自己估偏移」（运动来源中途换了时开关会变，变了就把两边的偏移状态清掉）
+    private var particleOffsetWasActive = false
+
+    /// 这次更新用不用「每个粒子自己估偏移」：用的话返回温度
+    var particleOffsetTemperatureInUse: Double? {
+        if config.particleOffsetFilter { return max(config.particleOffsetTemperature, 1e-6) }
+        guard config.particleOffsetFromMap, config.trackingOdometry == .pdr, config.pinnedConvergedMagWeight == nil,
+              let t = field.trackingTemperature, t <= TrackingCalibration.maxTemperature else { return nil }
+        return max(t, 1)
+    }
     private var obsEma: (Double, Double, Double)?
     /// 混合模式：这次读数相对地图的整体偏移（定到之后才有）
     private var offsetEst: MagneticFeature?
@@ -625,6 +657,9 @@ public final class MagneticLocalizer {
         bias = xs
         scale = [Double](repeating: 1, count: n)
         ema0 = [Double](repeating: .nan, count: n); ema1 = ema0; ema2 = ema0
+        off0 = ema0; off1 = ema0; off2 = ema0
+        offP = nil
+        particleOffsetWasActive = false
         obsEma = nil
         offsetEst = nil
         offsetResiduals.removeAll()
@@ -760,6 +795,7 @@ public final class MagneticLocalizer {
                 scale[k] = 1 + rng.normal() * config.initialScaleSigma
                 logw[k] = floorW - 2          // 新粒子先给一个中等偏低的权重，靠后面的地磁观测说话
                 if k < ema0.count { ema0[k] = .nan; ema1[k] = .nan; ema2[k] = .nan }
+                if k < off0.count { off0[k] = .nan; off1[k] = .nan; off2[k] = .nan }
             }
         }
         normalize()
@@ -849,6 +885,7 @@ public final class MagneticLocalizer {
                 scale[k] = 1 + rng.normal() * config.initialScaleSigma
                 logw[k] = floorW - 2
                 if k < ema0.count { ema0[k] = .nan; ema1[k] = .nan; ema2[k] = .nan }
+                if k < off0.count { off0[k] = .nan; off1[k] = .nan; off2[k] = .nan }
             }
         }
         normalize()
@@ -888,6 +925,7 @@ public final class MagneticLocalizer {
                 scale[k] = 1 + rng.normal() * config.initialScaleSigma
                 logw[k] = top - 1
                 if k < ema0.count { ema0[k] = .nan; ema1[k] = .nan; ema2[k] = .nan }
+                if k < off0.count { off0[k] = .nan; off1[k] = .nan; off2[k] = .nan }
             }
         }
         normalize()
@@ -1084,14 +1122,26 @@ public final class MagneticLocalizer {
         var lls = [Double?](repeating: nil, count: xs.count)
         var sumLL = 0.0, sumW = 0.0
         let a = 1 / max(config.offsetWindowUpdates, 1)
-        let usesEma = config.offsetInvariant || config.hybridOffset
+        let poTemp = particleOffsetTemperatureInUse
+        if (poTemp != nil) != particleOffsetWasActive {
+            // 开关变了（计步 ↔ 视觉里程计）：粒子偏移从头估；关掉时原来的偏移估计（offsetEst）留着，起伏平均从头攒
+            off0 = [Double](repeating: .nan, count: xs.count); off1 = off0; off2 = off0
+            offP = nil
+            if poTemp == nil {
+                ema0 = off0; ema1 = off0; ema2 = off0
+                obsEma = nil
+                offsetResiduals.removeAll()
+            }
+            particleOffsetWasActive = poTemp != nil
+        }
+        let usesEma = (config.offsetInvariant || config.hybridOffset) && poTemp == nil
         // 读数沿路的平均（原始读数）
         if usesEma {
             if let o = obsEma { obsEma = (o.0 + a * (f.total - o.0), o.1 + a * (f.vertical - o.1), o.2 + a * (f.horizontal - o.2)) }
             else { obsEma = (f.total, f.vertical, f.horizontal) }
         }
         // 混合模式：没定到 / 丢了 → 按起伏找；刚定到 → 偏移 = 读数平均 − 粒子沿路地图平均（按权重）；之后按绝对值比
-        if config.hybridOffset {
+        if config.hybridOffset && poTemp == nil {
             if !hasConverged {
                 offsetEst = nil
                 offsetResiduals.removeAll()
@@ -1119,37 +1169,43 @@ public final class MagneticLocalizer {
         // 残差差别大、彼此独立，按「找位置」的强度更新，不然走反的那团粒子要几十米才死
         let corrFactor = reacquiring ? 1 : max(config.magneticCorrelationCm / max(config.updateDistanceCm, 1), 1)
         let temp = baseTemp * corrFactor
-        for i in 0..<xs.count {
-            guard let m = field.sample(at: Point2(xs[i], ys[i])) else { continue }
-            let v0 = m.sigma.total * m.sigma.total + floor2
-            let v1 = m.sigma.vertical * m.sigma.vertical + floor2
-            let v2 = m.sigma.horizontal * m.sigma.horizontal + floor2
-            if usesEma {
-                // 粒子沿自己的路累积地图的平均；新粒子（NaN）从当前值开始
-                if ema0[i].isNaN { ema0[i] = m.mean.total; ema1[i] = m.mean.vertical; ema2[i] = m.mean.horizontal }
-                else {
-                    ema0[i] += a * (m.mean.total - ema0[i]); ema1[i] += a * (m.mean.vertical - ema1[i]); ema2[i] += a * (m.mean.horizontal - ema2[i])
+        if let poTemp {
+            // 强度全由温度定（标定量的就是「权重 1 / 温度」）：不乘 convergedMagWeight，配置档钉死的权重（Wi-Fi 冷启动档的 0）照乘
+            let pw = config.adaptiveMagWeight || config.pinnedConvergedMagWeight != nil ? mw : 1
+            particleOffsetLikelihoods(f, weight: pw * trust / poTemp, lls: &lls, sumLL: &sumLL, sumW: &sumW)
+        } else {
+            for i in 0..<xs.count {
+                guard let m = field.sample(at: Point2(xs[i], ys[i])) else { continue }
+                let v0 = m.sigma.total * m.sigma.total + floor2
+                let v1 = m.sigma.vertical * m.sigma.vertical + floor2
+                let v2 = m.sigma.horizontal * m.sigma.horizontal + floor2
+                if usesEma {
+                    // 粒子沿自己的路累积地图的平均；新粒子（NaN）从当前值开始
+                    if ema0[i].isNaN { ema0[i] = m.mean.total; ema1[i] = m.mean.vertical; ema2[i] = m.mean.horizontal }
+                    else {
+                        ema0[i] += a * (m.mean.total - ema0[i]); ema1[i] += a * (m.mean.vertical - ema1[i]); ema2[i] += a * (m.mean.horizontal - ema2[i])
+                    }
                 }
-            }
-            var ll: Double
-            if rel, let o = obsEma {
-                let r0 = (f.total - o.0) - (m.mean.total - ema0[i])
-                let r1 = (f.vertical - o.1) - (m.mean.vertical - ema1[i])
-                let r2 = (f.horizontal - o.2) - (m.mean.horizontal - ema2[i])
-                ll = w.0 * t(r0 * r0 / v0) + w.1 * t(r1 * r1 / v1) + w.2 * t(r2 * r2 / v2)
-                if config.absoluteWeight > 0 {
-                    let d0 = f.total - m.mean.total, d1 = f.vertical - m.mean.vertical, d2 = f.horizontal - m.mean.horizontal
-                    ll += config.absoluteWeight * (w.0 * t(d0 * d0 / (v0 + slack2)) + w.1 * t(d1 * d1 / (v1 + slack2)) + w.2 * t(d2 * d2 / (v2 + slack2)))
+                var ll: Double
+                if rel, let o = obsEma {
+                    let r0 = (f.total - o.0) - (m.mean.total - ema0[i])
+                    let r1 = (f.vertical - o.1) - (m.mean.vertical - ema1[i])
+                    let r2 = (f.horizontal - o.2) - (m.mean.horizontal - ema2[i])
+                    ll = w.0 * t(r0 * r0 / v0) + w.1 * t(r1 * r1 / v1) + w.2 * t(r2 * r2 / v2)
+                    if config.absoluteWeight > 0 {
+                        let d0 = f.total - m.mean.total, d1 = f.vertical - m.mean.vertical, d2 = f.horizontal - m.mean.horizontal
+                        ll += config.absoluteWeight * (w.0 * t(d0 * d0 / (v0 + slack2)) + w.1 * t(d1 * d1 / (v1 + slack2)) + w.2 * t(d2 * d2 / (v2 + slack2)))
+                    }
+                    ll *= mw * trust / temp
+                } else {
+                    let d0 = fAbs.total - m.mean.total, d1 = fAbs.vertical - m.mean.vertical, d2 = fAbs.horizontal - m.mean.horizontal
+                    ll = mw * trust * (w.0 * t(d0 * d0 / v0) + w.1 * t(d1 * d1 / v1) + w.2 * t(d2 * d2 / v2)) / temp
                 }
-                ll *= mw * trust / temp
-            } else {
-                let d0 = fAbs.total - m.mean.total, d1 = fAbs.vertical - m.mean.vertical, d2 = fAbs.horizontal - m.mean.horizontal
-                ll = mw * trust * (w.0 * t(d0 * d0 / v0) + w.1 * t(d1 * d1 / v1) + w.2 * t(d2 * d2 / v2)) / temp
+                lls[i] = ll
+                let pw = exp(logw[i])
+                sumLL += pw * ll
+                sumW += pw
             }
-            lls[i] = ll
-            let pw = exp(logw[i])
-            sumLL += pw * ll
-            sumW += pw
         }
         var neutral = sumW > 0 ? sumLL / sumW : 0
         // 覆盖门：已收敛时按「有数据粒子的权重占比」给地磁打折，大多落在没采过的地方时完全靠推算
@@ -1174,7 +1230,9 @@ public final class MagneticLocalizer {
         }
         lastLogEvidence = normalize()
         // 混合模式：定到之后慢慢跟踪偏移（读数 − 地图在当前位置的值）
-        if config.hybridOffset, config.offsetWarmupUpdates > 0 {
+        if poTemp != nil {
+            offsetEst = weightedParticleOffset()
+        } else if config.hybridOffset, config.offsetWarmupUpdates > 0 {
             updateRobustOffset(f)
         } else if config.hybridOffset, let off = offsetEst, let c = committed ?? lastCenter, let m = field.sample(at: c) {
             let r = config.offsetTrackRate
@@ -1204,6 +1262,62 @@ public final class MagneticLocalizer {
             return v.count % 2 == 1 ? v[v.count / 2] : (v[v.count / 2 - 1] + v[v.count / 2]) / 2
         }
         offsetEst = MagneticFeature(total: med(\.total), vertical: med(\.vertical), horizontal: med(\.horizontal))
+    }
+
+    /// 每个粒子自己估偏移（`particleOffsetFilter` / `particleOffsetFromMap`）：残差 r = 读数 − 粒子处地图，新息 ν = r − b̂，
+    /// 似然 t4(ν² / S)（S = P + q + R + 格子方差，三个分量按 featureWeights 加权）× weight（已除温度）；再用 ν 更新 b̂。
+    /// 单个分量的算法和地图标定共用（`ParticleOffsetModel`）。
+    /// 还没有偏移估计的粒子（刚撒 / 注入的）：b̂ 取它自己的残差，这一次给其余粒子的平均似然（对它的偏移还一无所知，不奖不罚）。
+    /// 没有地图数据的粒子 lls 留 nil（由调用方按原规则处理），b̂ 不动。
+    /// 计算量：每个粒子每次更新多 3 次乘加和 3 个 Double 的状态（1500 粒子 = 36 KB），和原来的地图插值相比可以忽略。
+    private func particleOffsetLikelihoods(_ f: MagneticFeature, weight: Double, lls: inout [Double?],
+                                           sumLL: inout Double, sumW: inout Double) {
+        let w = config.featureWeights
+        let r = max(config.particleOffsetWhiteVarUT2, 1e-6)
+        // 随机游走按这次更新实际走过的路折算（更新间隔 ≥ updateDistanceCm）
+        let q = max(config.particleOffsetWalkVarUT2, 0) * max(travelledCm / max(config.updateDistanceCm, 1), 1)
+        let prior = offP.map { ($0.0 + q, $0.1 + q, $0.2 + q) }
+        let k = weight
+        func comp(_ res: Double, _ b: inout Double, _ pm: Double, _ s: Double, _ wc: Double) -> Double {
+            wc * ParticleOffsetModel.component(residual: res, offset: &b, priorVar: pm, whiteVar: r, cellSigma: s)
+        }
+        var fresh: [Int] = []
+        for i in 0..<xs.count {
+            guard let m = field.sample(at: Point2(xs[i], ys[i])) else { continue }
+            let r0 = f.total - m.mean.total, r1 = f.vertical - m.mean.vertical, r2 = f.horizontal - m.mean.horizontal
+            guard let pm = prior, !off0[i].isNaN else {
+                off0[i] = r0; off1[i] = r1; off2[i] = r2
+                fresh.append(i)
+                continue
+            }
+            let ll = k * (comp(r0, &off0[i], pm.0, m.sigma.total, w.0) + comp(r1, &off1[i], pm.1, m.sigma.vertical, w.1)
+                          + comp(r2, &off2[i], pm.2, m.sigma.horizontal, w.2))
+            lls[i] = ll
+            let pw = exp(logw[i])
+            sumLL += pw * ll
+            sumW += pw
+        }
+        let avg = sumW > 0 ? sumLL / sumW : 0
+        for i in fresh {
+            lls[i] = avg
+            let pw = exp(logw[i])
+            sumLL += pw * avg
+            sumW += pw
+        }
+        // 共用方差：卡尔曼更新（只按 R，不含各粒子的格子方差）；第一次 = R（新粒子的偏移就是它自己的残差）
+        offP = prior.map { (ParticleOffsetModel.posterior(priorVar: $0.0, whiteVar: r), ParticleOffsetModel.posterior(priorVar: $0.1, whiteVar: r),
+                            ParticleOffsetModel.posterior(priorVar: $0.2, whiteVar: r)) } ?? (r, r, r)
+    }
+
+    /// 粒子偏移估计的加权平均（每个粒子自己估偏移时；`currentOffset`，以及换回原来的似然时接着用）
+    private func weightedParticleOffset() -> MagneticFeature? {
+        let mx = logw.max() ?? 0
+        var sw = 0.0, s0 = 0.0, s1 = 0.0, s2 = 0.0
+        for i in 0..<xs.count where i < off0.count && !off0[i].isNaN {
+            let wi = exp(logw[i] - mx)
+            sw += wi; s0 += wi * off0[i]; s1 += wi * off1[i]; s2 += wi * off2[i]
+        }
+        return sw > 0 ? MagneticFeature(total: s0 / sw, vertical: s1 / sw, horizontal: s2 / sw) : nil
     }
 
     /// 决定认定哪个簇：离当前认定位置近就直接跟；远的另一个簇要连续确认几次才切过去。
@@ -1411,6 +1525,9 @@ public final class MagneticLocalizer {
     private func adopt(_ o: MagneticLocalizer) {
         xs = o.xs; ys = o.ys; bias = o.bias; scale = o.scale; logw = o.logw
         ema0 = o.ema0; ema1 = o.ema1; ema2 = o.ema2
+        off0 = o.off0; off1 = o.off1; off2 = o.off2
+        offP = o.offP
+        particleOffsetWasActive = o.particleOffsetWasActive
         obsEma = o.obsEma
         offsetEst = o.offsetEst
         offsetResiduals = o.offsetResiduals
@@ -1501,6 +1618,7 @@ public final class MagneticLocalizer {
         var u = rng.uniform() * step
         var nx = [Double](repeating: 0, count: m), ny = nx, nb = nx, ns = nx
         var e0 = [Double](repeating: .nan, count: m), e1 = e0, e2 = e0
+        var o0 = e0, o1 = e0, o2 = e0
         var src = [Int](repeating: 0, count: m)  // 每个新粒子的重采样来源下标；注入粒子为 -1
         var anchor = [Point2?](repeating: nil, count: m)  // 注入粒子的可走锚点
         var j = 0
@@ -1511,6 +1629,7 @@ public final class MagneticLocalizer {
             nb[i] = bias[j]
             ns[i] = scale[j]
             if j < ema0.count { e0[i] = ema0[j]; e1[i] = ema1[j]; e2[i] = ema2[j] }
+            if j < off0.count { o0[i] = off0[j]; o1[i] = off1[j]; o2[i] = off2[j] }
             src[i] = j
             u += step
         }
@@ -1537,6 +1656,7 @@ public final class MagneticLocalizer {
             nb[i] = headingUnknown && config.uniformHeadingForInjection ? (rng.uniform() * 2 - 1) * Double.pi : rng.normal() * config.initialHeadingBiasSigmaDeg * Double.pi / 180
             ns[i] = 1 + rng.normal() * config.initialScaleSigma
             e0[i] = .nan; e1[i] = .nan; e2[i] = .nan
+            o0[i] = .nan; o1[i] = .nan; o2[i] = .nan
         }
         for i in 0..<m {
             var p = Point2(min(max(nx[i], 0), field.widthCm), min(max(ny[i], 0), field.heightCm))
@@ -1559,6 +1679,7 @@ public final class MagneticLocalizer {
         }
         xs = nx; ys = ny; bias = nb; scale = ns
         ema0 = e0; ema1 = e1; ema2 = e2
+        off0 = o0; off1 = o1; off2 = o2
         logw = [Double](repeating: -log(Double(m)), count: m)
     }
 

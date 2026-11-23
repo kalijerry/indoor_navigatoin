@@ -133,6 +133,28 @@ public enum SessionEvaluator {
         }
     }
 
+    /// 跟踪似然的地图标定（`TrackingCalibration`）：建图会话按下标奇偶分两折，一折建图、另一折沿自己的参考轨迹
+    /// （有 truth.csv 用它，没有用自己的锚点对齐）每 50 cm 取一次读数和图比，两折合起来标定。hpass-build 出图时同一份。
+    /// 会话不到 2 个、标不出来（窗口太少 / 图上没有米级信息）时 nil。
+    /// 计算量：多建两次图 + 每个建图会话回放一遍特征流水线（不跑定位），离线做，手机上不算。
+    public static func trackingCalibration(sessions: [URL], map: StoreMap, mode: MapBuild = .fusion,
+                                           tagPositions: [String: Point2] = [:]) -> TrackingCalibration.Result? {
+        guard sessions.count >= 2 else { return nil }
+        let every = MagneticConfig().updateDistanceCm
+        var folds: [TrackingCalibration.Fold] = []
+        for k in 0..<2 {
+            let held = sessions.indices.filter { $0 % 2 == k }.map { sessions[$0] }
+            let rest = sessions.indices.filter { $0 % 2 != k }.map { sessions[$0] }
+            guard let f = try? buildMaps(sessions: rest, map: map, mode: mode, tagPositions: tagPositions).field else { continue }
+            let seqs = held.compactMap { u in
+                (try? residualSamples(dir: u, field: f, map: map, everyCm: every))?
+                    .map { TrackingCalibration.Sample(feature: $0.feature, reference: $0.reference) }
+            }
+            folds.append(.init(field: f, sequences: seqs))
+        }
+        return TrackingCalibration.calibrate(folds: folds)
+    }
+
     /// - Parameter rooms: 地图有单元（房间 / 走廊）时用房间约束版（墙挡住、门打通、带房间编号，见 `RoomGraph`）
     public static func walkable(_ map: StoreMap, rooms: Bool = false) -> WalkableMap? {
         if rooms, map.crosses.isEmpty, let w = WalkableMap(roomsOf: map) { return w }

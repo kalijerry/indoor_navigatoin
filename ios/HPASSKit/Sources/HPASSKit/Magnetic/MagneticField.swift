@@ -28,6 +28,10 @@ public struct MagneticFieldMap {
     public let rows: Int
     let cells: [MagneticFeature?]
     let sigmas: [MagneticFeature?]
+    /// 跟踪似然的地图标定（`TrackingCalibration`，建图时用建图会话交叉验证量出）：「每个粒子自己估偏移」的似然在这张图上
+    /// 该除的温度。nil = 没标定（老地图 / 会话太少 / 图上没有米级信息），跟踪照旧用原来的似然。
+    /// 存在地图 JSON 的 magField.trackingTemperature 和地图包的说明里。
+    public var trackingTemperature: Double?
 
     /// 有数据格子的 |B| 分位数区间（lo、hi 是 0～1）。不到 20 格时 nil。App 用它核对本机磁力计偏置（磁吸附件 / 磁性保护壳）
     public func totalPercentiles(_ lo: Double, _ hi: Double) -> ClosedRange<Double>? {
@@ -124,7 +128,9 @@ extension StoreDataLoader {
         guard cells.count == cols * rows, sigmas.count == cols * rows else {
             throw StoreDataError.unsupportedFormat("magField 格子数 \(cells.count) 与 \(cols)×\(rows) 不一致")
         }
-        return MagneticFieldMap(widthCm: w, heightCm: h, cellCm: cell, cells: cells, sigmas: sigmas)
+        var field = MagneticFieldMap(widthCm: w, heightCm: h, cellCm: cell, cells: cells, sigmas: sigmas)
+        field.trackingTemperature = num(mf["trackingTemperature"]).flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        return field
     }
 
     /// 地图里磁场的来源：`raw`（原始磁力计减会话偏置中位数）或 `calibrated`（iOS 校准后，旧地图）。

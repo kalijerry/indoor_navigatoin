@@ -27,6 +27,8 @@ public enum MapPackage {
         public var origin: String?
         /// 融合用了几个会话
         public var sessions: Int?
+        /// 磁场图的跟踪似然标定（`MagneticFieldMap.trackingTemperature`；磁场段的二进制格式不变，放在说明里）
+        public var trackingTemperature: Double?
 
         public init(id: String, name: String, kind: String, version: Int64, source: String? = nil,
                     mapUpBearingDeg: Double? = nil, magSource: String? = nil) {
@@ -70,6 +72,7 @@ public enum MapPackage {
                               worldMap: Data?, paint: Data? = nil, tagCSV: Data? = nil, direction: Data? = nil) throws -> Data {
         var meta = m
         meta.fieldCells = field?.coveredCells
+        meta.trackingTemperature = field?.trackingTemperature
         meta.bleTags = ble?.tags.count
         var out = Data(magic)
         out.append(le(formatVersion))
@@ -116,8 +119,10 @@ public enum MapPackage {
         let p = r.atEnd ? Data() : try section()
         let e = r.atEnd ? Data() : try section()
         let dc = r.atEnd ? Data() : try section()
+        var field = f.isEmpty ? nil : try decodeField(f)
+        field?.trackingTemperature = meta.trackingTemperature.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
         return Contents(meta: meta, mapJSON: mapJSON,
-                        field: f.isEmpty ? nil : try decodeField(f),
+                        field: field,
                         ble: b.isEmpty ? nil : try decodeBLE(b),
                         worldMap: w.isEmpty ? nil : w,
                         paint: p.isEmpty ? nil : p,
