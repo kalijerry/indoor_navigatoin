@@ -10,9 +10,52 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# 只跑和改动有关的 job：先用 changes 算出改了哪几块，其余 job 跳过。
+# 用 job 级 if 而不是 on.paths：跳过的 job 显示为 skipped，分支保护里设成必需的检查照样算通过。
+# 手动运行（workflow_dispatch）或改了本文件时全部都跑。
 jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      hpasskit: ${{ github.event_name == 'workflow_dispatch' || steps.f.outputs.hpasskit == 'true' }}
+      ios: ${{ github.event_name == 'workflow_dispatch' || steps.f.outputs.ios == 'true' }}
+      android: ${{ github.event_name == 'workflow_dispatch' || steps.f.outputs.android == 'true' }}
+      python: ${{ github.event_name == 'workflow_dispatch' || steps.f.outputs.python == 'true' }}
+      telemetry: ${{ github.event_name == 'workflow_dispatch' || steps.f.outputs.telemetry == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: f
+        with:
+          filters: |
+            ci: &ci
+              - .github/workflows/ci.yml
+            hpasskit:
+              - *ci
+              - "ios/HPASSKit/**"
+              # VenueAuthoringTests 会调 tools/venue/imdf_convert.py 读回 Swift 导出的 IMDF
+              - "tools/venue/**"
+            ios:
+              - *ci
+              - "ios/**"
+            android:
+              - *ci
+              - "android/**"
+            python:
+              - *ci
+              - "tools/**"
+            telemetry:
+              - *ci
+              - "server/telemetry/**"
+
   hpasskit:
     name: HPASSKit (swift test)
+    needs: changes
+    if: needs.changes.outputs.hpasskit == 'true'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -24,6 +67,8 @@ jobs:
 
   ios-app:
     name: iOS app (xcodebuild, unsigned ipa)
+    needs: changes
+    if: needs.changes.outputs.ios == 'true'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +112,8 @@ jobs:
 
   android:
     name: Android collector
+    needs: changes
+    if: needs.changes.outputs.android == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -85,6 +132,8 @@ jobs:
 
   python:
     name: Python tools
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -99,6 +148,8 @@ jobs:
 
   telemetry:
     name: Telemetry worker (syntax)
+    needs: changes
+    if: needs.changes.outputs.telemetry == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -11,7 +11,13 @@ name: iOS Ad Hoc (signed)
 on:
   push:
     branches: [main]
-    paths: ["ios/**", ".github/workflows/ios-adhoc.yml", "tools/ios/**"]
+    # 只测试 / 文档的改动不影响装到手机上的包，不重新打
+    paths:
+      - "ios/**"
+      - "tools/ios/**"
+      - ".github/workflows/ios-adhoc.yml"
+      - "!ios/HPASSKit/Tests/**"
+      - "!**/*.md"
   workflow_dispatch:
 
 concurrency:

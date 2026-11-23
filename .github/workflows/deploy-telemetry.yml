@@ -14,7 +14,10 @@ name: Deploy telemetry worker
 on:
   push:
     branches: [main]
-    paths: ["server/telemetry/**", ".github/workflows/deploy-telemetry.yml"]
+    paths:
+      - "server/telemetry/**"
+      - ".github/workflows/deploy-telemetry.yml"
+      - "!server/telemetry/**/*.md"
   workflow_dispatch:
 
 concurrency:
