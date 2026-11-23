@@ -230,6 +230,66 @@ class PreparePublicCacheTests(unittest.TestCase):
         self.assertNotEqual(k1, lab.convert_key(self.conv, ["--drift", "pdr"]))
 
 
+class SimAndLooTests(unittest.TestCase):
+    """合成小场地数据集的转换缓存，留一法协议，后台排除名单。"""
+
+    def test_sim_dataset_uses_sim_script(self):
+        tmp = Path(tempfile.mkdtemp())
+        sim = tmp / "sim.py"
+        sim.write_text("# sim\n")
+        calls = []
+
+        def fake_run(cmd, check):
+            calls.append(cmd)
+            Path(cmd[2]).mkdir(parents=True, exist_ok=True)
+            (Path(cmd[2]) / "manifest.json").write_text("{}")
+        suite = {"datasets": {"s": {"kind": "sim", "layout": "pair", "drift": "phone", "seed": 3}}}
+        lab.prepare_public(suite, tmp / "ilc", tmp / "work", conv=tmp / "nope.py", run=fake_run, sim_conv=sim)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1:3], [str(sim), str(tmp / "work" / "public" / "s")])
+        self.assertEqual(calls[0][3:], ["--drift", "phone", "--layout", "pair", "--seed", "3"])
+        lab.prepare_public(suite, tmp / "ilc", tmp / "work", conv=tmp / "nope.py", run=fake_run, sim_conv=sim)
+        self.assertEqual(len(calls), 1)                          # 没变：用缓存
+
+    def test_suite_sim_datasets_exist(self):
+        for s in SUITE["scenarios"]:
+            self.assertIn(s["dataset"], SUITE["datasets"], s["id"])
+        sims = [n for n, d in SUITE["datasets"].items() if d.get("kind") == "sim"]
+        self.assertTrue(sims)
+
+    def test_loo_folds(self):
+        folds = lab.loo_folds(["a", "b", "c"])
+        self.assertEqual(folds, [(["b", "c"], "a"), (["a", "c"], "b"), (["a", "b"], "c")])
+
+    def test_session_excluded_accepts_both_spellings(self):
+        ex = {"ios_survey_20261109_141403", "mag_20261109_161905_files"}
+        self.assertTrue(lab.session_excluded("ios_survey_20261109_141403.zip", ex))
+        self.assertTrue(lab.session_excluded("mag_20261109_161905_files.zip", ex))
+        self.assertFalse(lab.session_excluded("ios_survey_20261112_135825.zip", ex))
+
+    def test_loo_protocol_runs_each_fold(self):
+        tmp = Path(tempfile.mkdtemp())
+        work = tmp / "work"
+        d = work / "private" / "site-x"
+        d.mkdir(parents=True)
+        (d / "map.json").write_text("{}")
+        (work / "private" / "manifest.json").write_text(json.dumps([{"label": "site-x", "build": ["a", "b", "c"], "test": [], "loo": True}]))
+        fake = tmp / "fake_eval.py"
+        fake.write_text(FAKE_EVAL)
+        suite = {"runs": {"pr": 1}, "datasets": {}, "scenarios": [],
+                 "private": {"tiers": ["pr"], "gate": True, "protocols": {
+                     "leave-one-out": {"title": "loo", "flags": ["--motion", "pdr-imu"], "track_flags": ["--oracle-start"],
+                                       "cold_flags": [], "gate": False}}}}
+        res = lab.run_suite(suite, "pr", work, [sys.executable, str(fake)])
+        ids = [r["id"] for r in res["results"]]
+        self.assertEqual(ids, ["private/site-x/leave-one-out/track", "private/site-x/leave-one-out/cold"])
+        for r in res["results"]:
+            self.assertNotIn("error", r)
+            self.assertFalse(r["gate"])
+            self.assertEqual(r["metrics"]["replays"], 3)         # 3 折 × 1 次
+            self.assertEqual(r["loo_folds"], 3)
+
+
 FAKE_EVAL = textwrap.dedent("""
     import json, sys
     a = sys.argv

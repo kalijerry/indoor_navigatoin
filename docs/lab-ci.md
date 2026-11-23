@@ -28,6 +28,18 @@
 | `public/imu/track-mag`、`public/imu/cold-mag-radio`（PR + 每晚）；`public/imu/cold-mag-search`、`public/imu/cold-wifi`（每晚） | **真实 IMU**：数据集 `ilc-imu`（`ilc_convert.py --drift imu --flip-y`）的测试会话不写合成位姿，`hpass-eval --motion pdr-imu` 把手机的真实 IMU 送进 FusionEngine（配置和 App 实时定位页同一份 `FusionEngine.live`，罗盘关），推算位置的增量再推粒子（`ShadowLocalizer.odometryStep`）。已知起点的起步朝向取真值前 1.5 m（ILC 是手持，手机-行走夹角 δ≈0）；冷启动从地图中心、朝向 0 起步、粒子整圆。多出一张「办公室指标」表（≤1 m 按时间、TTFF 等） |
 | `public/imu/track-mag-carry`（PR + 每晚）；`public/imu/track-mag-noheading`、`public/imu/track-mag-noheading-carry`（每晚） | 同上的真实 IMU 回放，加 `--carry-motion`（携带无关运动模型 + 按携带方式重撒 + 步长 K 在线标定，App 默认）和 / 或 `--start-heading unknown`（起步朝向整圆：口袋 / 包里起步的条件）。ILC 是手持数据，携带方式分类应判成看屏 / 竖持，这几个场景守的是「新运动模型在手持上不比老的差」，口袋 / 包 / 摆臂 / 通话仍要等自采 office-carry 数据 |
 
+**合成小场地**（`sim-*`，每次都跑，不用任何外部数据，可以放心公开和商用）：[tools/bench/sim_small.py](../tools/bench/sim_small.py) 按自己定的模型生成
+房间 + 门的地图（单元、MapDoor）、磁场（地磁背景 + 随机平面波 + 墙里的偶极子，统计量对着真实办公室调）、建图会话（经门走遍每间房，房里来回走）
+和测试会话（房间之间随机走、偶尔停下）。商场数据量不到「小面积」的问题（房间认反、过门、步长偏短在十几米的房间里放大），这组专门量它。
+
+| 场景 | 意义 |
+|---|---|
+| `public/sim-office/track-mag` | 约 320 m² 办公室，已知起点，只地磁 + 房间约束，PDR 漂移（尺度 σ4%） |
+| `public/sim-office-phone/track-mag`、`public/sim-pair-phone/track-mag` | 同上 / 两间并排一扇门，漂移按 2026-11 办公室实测：步长系统性偏短（尺度均值 0.82）。和上一行的差 = 步长偏短的代价 |
+| `public/sim-office-phone/cold-mag`（每晚） | 冷启动 |
+
+合成数据只能说明「算法在一个干净、地图和真值完全一致的世界里」怎么样；真实地图的毛病（比如房间分界画错）要靠下面的自采留一法。
+
 `public/pdr/*` 不经过 FusionEngine（位姿是合成的），留着当粒子滤波 / 地图侧的回归守门；`public/imu/*` 和它同一份建图 / 测试划分，
 两组数字的差就是「合成漂移 vs 真实计步」的代价。ILC 的坐标 y 朝北，我们的地图 y 朝下（`FusionTypes.swift`：θ̇ = +ω_up），
 不翻转时真实陀螺的左转在地图上变成右转（量过：不翻转纯推算中位 15～60 m，翻转后 1.5～15 m），所以 `ilc-imu` 带 `"flip_y": true`；
@@ -37,6 +49,7 @@
 
 | 协议 | 做法 |
 |---|---|
+| `leave-one-out` | **不用专门去走测试**：一张地图有 ≥ 3 次能用的建图会话时，每次拿掉一次，用其余的建图，再把拿掉那次的真实 IMU + 磁力计按 App 默认配置回放（`--motion pdr-imu --carry-motion --rooms --stationary-freeze`），参考轨迹 = 它自己的锚点 + ARKit。已知起点、冷启动各一个场景，带办公室指标；先不拦（`gate: false`）。后台排除名单（`/api/config/exclude`）和采集质量不合格的会话不用 |
 | `walk-once` | **每个建图会话单独建图（= 只走一遍）**，用不是同一天的测试会话来测，所有组合混在一起出指标。这是对标 Oriient「走一遍就能用」的核心指标 |
 | `all-builds` | 全部建图会话融合后测 |
 | `track` | 全部建图会话融合，**已知起点跟踪**（`--oracle-start`）：量 App 实时定位的跟踪配置档（`MagneticConfig.tracking`）在自采门店上的表现。前两个协议都是冷启动 |

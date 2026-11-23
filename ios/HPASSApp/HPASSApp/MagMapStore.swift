@@ -116,7 +116,7 @@ final class MagMapStore: ObservableObject {
         if let w = walkableCache { return w }
         if let rm = roomMap, let w = WalkableMap(roomsOf: rm) {
             walkableCache = w
-            AppLog.i("地磁", "可走区域（房间图）：\(w.rooms?.rooms.count ?? 0) 个单元、\(w.rooms?.doors.count ?? 0) 扇门，不经门不能换房间")
+            AppLog.i("地磁", "可走区域（房间图）：\(w.rooms?.rooms.count ?? 0) 个单元、\(w.rooms?.doors.count ?? 0) 扇门、\(w.rooms?.openSeams ?? 0) 段没墙的分界，不经门不能换房间")
             return w
         }
         if crosses.isEmpty && !floor.isEmpty {
