@@ -213,6 +213,8 @@ public enum SessionEvaluator {
         public var headingHistogram: [Double]? = nil
         /// 全部粒子相对报的位置的加权 RMS 距离（cm）
         public var spreadAroundEstimateCm: Double? = nil
+        /// 全部粒子的加权平均位置
+        public var particleMean: Point2? = nil
     }
 
     /// 逐点轨迹里带上粒子散布等诊断量（hpass-eval --diag-out）。默认关：每拍要多扫一遍粒子
@@ -351,6 +353,7 @@ public enum SessionEvaluator {
             if Self.trackDiagnostics {
                 let ws = sh.localizer.weightedSpread(), ss = sh.localizer.scaleStatistics()
                 tp.spreadCm = ws.spreadCm
+                tp.particleMean = ws.mean
                 tp.headingSpreadDeg = ws.headingSpreadDeg
                 tp.scaleMedian = ss.median
                 tp.scaleSigma = ss.sigma

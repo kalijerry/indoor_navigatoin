@@ -155,7 +155,7 @@ do {
     // --diag-out：诊断用，每个运动节拍一行估计 + 参考 + 置信度 + 粒子散布 / 航向散布 / 步长比例（每拍多扫一遍粒子，只给诊断）
     let diagOut = arg("--diag-out")
     if diagOut != nil { SessionEvaluator.trackDiagnostics = true }
-    var diagLines = ["session,run,t_ms,est_x,est_y,converged,unc_cm,ref_x,ref_y,confidence,spread_cm,heading_spread_deg,scale_median,scale_sigma,odo_x,odo_y,heading_hist,spread_est_cm"]
+    var diagLines = ["session,run,t_ms,est_x,est_y,converged,unc_cm,ref_x,ref_y,confidence,spread_cm,heading_spread_deg,scale_median,scale_sigma,odo_x,odo_y,heading_hist,spread_est_cm,mean_x,mean_y"]
     var odoLines = ["session,run,t_ms,odo_x,odo_y,ref_x,ref_y,est_x,est_y,converged,unc_cm"]
     var trackLines = ["session,run,t_ms,est_x,est_y,converged,unc_cm,ref_x,ref_y,room_id,room_mass,carry_mode,frozen"]
     let carryMotion = CommandLine.arguments.contains("--carry-motion")
@@ -198,6 +198,7 @@ do {
                 if let v = arg("--conv-pos-noise").flatMap(Double.init) { cfg.convergedPositionNoiseFraction = v }
                 if let v = arg("--particles").flatMap(Int.init) { cfg.particleCount = v }
                 if let v = arg("--jump-confirm").flatMap(Int.init) { cfg.jumpConfirmUpdates = v }
+                if let v = arg("--keep-near").flatMap(Int.init) { cfg.keepClusterRequiresNear = v != 0 }
                 if let v = arg("--blocked-penalty").flatMap(Double.init) { cfg.blockedPenalty = v }
                 if CommandLine.arguments.contains("--hard-ble-tracking") { cfg.bleSoftTracking = false }
                 if CommandLine.arguments.contains("--ble-soft-no-recover") { cfg.bleSoftLocalRecovery = false }
@@ -234,7 +235,7 @@ do {
                                      + "\(f3(p.confidence)),\(f1(p.spreadCm.flatMap { $0.isFinite ? $0 : nil })),\(f1(p.headingSpreadDeg)),"
                                      + "\(f3(p.scaleMedian)),\(f3(p.scaleSigma)),\(f1(p.odometry?.x)),\(f1(p.odometry?.y)),"
                                      + (p.headingHistogram ?? []).map { String(format: "%.2f", $0) }.joined(separator: ";")
-                                     + ",\(f1(p.spreadAroundEstimateCm))")
+                                     + ",\(f1(p.spreadAroundEstimateCm)),\(f1(p.particleMean?.x)),\(f1(p.particleMean?.y))")
                 }
                 if odoOut != nil, let o = p.odometry {
                     odoLines.append("\(t.lastPathComponent),\(k + 1),\(p.tMs),\(f1(o.x)),\(f1(o.y)),\(f1(p.reference.x)),\(f1(p.reference.y)),"
