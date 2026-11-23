@@ -13,6 +13,10 @@ import HPASSKit
 //   --carry-motion                pdr-imu 时打开携带无关的运动模型 + 粒子按携带模式重撒 + 步长 K 在线标定（App 同一套接法）
 //   --stationary-freeze           pdr-imu 时打开静止冻结（惯导说没在动就算静止；办公室坐着不动用，配合 --rooms）
 //   --dr-dump dr.csv              诊断：只对 --test 跑纯计步推算（起点 / 朝向取参考轨迹），逐拍写 CSV，给 tools/bench/dr_decompose.py 拆误差
+//   --residuals res.csv           只导出测试会话「实测特征 vs 地图在参考位置」的残差（含参考坐标），不跑定位；
+//                                 没有 truth.csv 的会话用它自己的锚点对齐当参考（留一法，tools/bench/map_cv.py 用）
+//   --field-out field.json        把建好的磁场图（magField 节点）写出来
+//   --fill-radius cm / --gp-length cm / --fill gp|idw   磁场图补空格的试验开关（默认 = 产品设置 150 / 100 / gp）
 
 func arg(_ name: String) -> String? {
     guard let i = CommandLine.arguments.firstIndex(of: name), i + 1 < CommandLine.arguments.count else { return nil }
@@ -66,6 +70,10 @@ do {
     let mapMode = modes[arg("--map-build") ?? "fusion"] ?? .fusion
     // --wifi：Wi-Fi 冷启动（只有 Android 能扫 Wi-Fi；见 WiFiColdStartProfile），用建图会话的 wifi.csv 建指纹
     let useWiFi = CommandLine.arguments.contains("--wifi")
+    // 磁场图补空格的试验开关（默认 = 产品的设置）
+    if let v = arg("--fill-radius").flatMap(Double.init) { MagneticFieldBuilder.defaultFillRadiusCm = v }
+    if let v = arg("--fill").flatMap(MagneticFieldBuilder.FillMethod.init(rawValue:)) { MagneticFieldBuilder.defaultFillMethod = v }
+    if let v = arg("--gp-length").flatMap(Double.init) { MagneticFieldBuilder.defaultGPLengthCm = v }
     let built = try SessionEvaluator.buildMaps(sessions: build, map: map, mode: mapMode, tagPositions: refTags ?? [:],
                                                withWiFi: useWiFi)
     let field = built.field, bleMap = built.ble
@@ -100,15 +108,20 @@ do {
         ble = TagLocations.seededBLEMap(TagLocations.parse(t, map: map), learned: bleMap)
         print("蓝牙底图：标签位置表 + 学到的，\(ble!.tags.count) 个标签")
     }
+    // 诊断：把建好的磁场图（magField 节点）写出来
+    if let fp = arg("--field-out") {
+        try JSONSerialization.data(withJSONObject: field.jsonObject()).write(to: URL(fileURLWithPath: fp))
+    }
     // 诊断：只导出测试会话「实测特征 vs 地图在参考位置」的残差（每 50 cm 一条），不跑定位
     if let rp = arg("--residuals") {
-        var csv = "session,t_ms,path_cm,f_total,f_vertical,f_horizontal,m_total,m_vertical,m_horizontal,s_total,s_vertical,s_horizontal" + "\n"
+        var csv = "session,t_ms,path_cm,f_total,f_vertical,f_horizontal,m_total,m_vertical,m_horizontal,s_total,s_vertical,s_horizontal,ref_x,ref_y" + "\n"
         func f3(_ v: MagneticFeature?) -> String {
             v.map { String(format: "%.3f,%.3f,%.3f", $0.total, $0.vertical, $0.horizontal) } ?? ",,"
         }
         for t in test {
-            for r in try SessionEvaluator.residualSamples(dir: t, field: field) {
-                csv += "\(t.lastPathComponent),\(r.tMs),\(String(format: "%.1f", r.pathCm)),\(f3(r.feature)),\(f3(r.mean)),\(f3(r.sigma))" + "\n"
+            for r in try SessionEvaluator.residualSamples(dir: t, field: field, map: map) {
+                csv += "\(t.lastPathComponent),\(r.tMs),\(String(format: "%.1f", r.pathCm)),\(f3(r.feature)),\(f3(r.mean)),\(f3(r.sigma)),"
+                    + String(format: "%.1f,%.1f", r.reference.x, r.reference.y) + "\n"
             }
         }
         try csv.write(toFile: rp, atomically: true, encoding: .utf8)
