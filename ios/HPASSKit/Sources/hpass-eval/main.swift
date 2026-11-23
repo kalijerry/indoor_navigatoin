@@ -21,7 +21,7 @@ import HPASSKit
 //                                 （第一个会话从 --k-state 读到的、或空 = App 第一次用）。报告带 sequenceIndex
 //   --k-state k.json              --carry-k 的初始 / 结束状态（每次回放一份；文件存在就先读，回放完写回）：留一法逐折串起来用
 //   --vio-k                       --carry-k 时每个测试会话回放（摄像头关）之后，再用它自己的 ARKit 位姿按 App 的视觉里程计标定
-//                                 学一遍 K（这次会话当时若是测绘 / 开着摄像头，App 会学到的），带给下一个会话。合成位姿（公开数据集）别用
+//                                 学一遍 K（这段路当时若是开着摄像头增强定位，App 会学到的；App 测绘时不学 K），带给下一个会话。合成位姿（公开数据集）别用
 //   --posterior-k                 对照：按原来的做法把粒子步长比例后验写进 K（StepScaleCalibrator.learnFromPosterior）
 //   --step-scale x                诊断：惯导步长整体乘 x（FusionConfig.stepLengthScale）
 //   --odo-out odo.csv             诊断：每个运动节拍一行纯推算位置（pdr-imu：惯导输出；poses：只转了方向的位姿）+ 参考 + 估计

@@ -20,7 +20,8 @@
   leave-one-out 留一法：一个地图有 ≥ 3 次能用的建图会话时，每次拿掉一个，用其余的建图，再用拿掉那次的真实 IMU + 磁力计
                 （--motion pdr-imu）回放，参考轨迹 = 它自己的锚点 + ARKit 对齐。不用专门去走测试，小场地（办公室）也有分数。
                 协议里有 chain_flags 时多一个 track-k：各折按会话开始时间排序依次跑，带着前面学到的步长 K
-                （hpass-eval --carry-k --k-state，App 的 StepScaleStore 行为；--vio-k = 前面的测绘会话用视觉里程计标定过 K）
+                （hpass-eval --carry-k --k-state，App 的 StepScaleStore 行为；--vio-k = 前面的会话若开着摄像头增强定位、用视觉里程计标定过 K；
+                App 测绘时不学 K）
   office-carry  盲测机（摄像头关，按被测携带方式带）+ 真值伴随机（ARKit），敲击对时（bump_sync.py），真实 IMU 回放
                 （--motion pdr-imu），冷启动和已知起点各一次；办公室指标（office_metrics.py）按携带方式 / 地图年龄聚合
 站点在报告里只用代号：设置了 HPASS_LAB_SALT 时 = HMAC-SHA256(盐, map_id) 前 6 位（仓库公开，没有盐就猜不出），
