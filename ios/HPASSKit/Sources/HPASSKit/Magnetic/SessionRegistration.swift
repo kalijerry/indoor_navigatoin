@@ -72,8 +72,10 @@ public struct SessionRegistration {
     public struct Session {
         public var name: String
         public var samples: [(p: Point2, f: MagneticFeature, tMs: Int64)]
-        public init(name: String, samples: [(p: Point2, f: MagneticFeature, tMs: Int64)]) {
-            self.name = name; self.samples = samples
+        /// 固定不动（手动摆好的段）：当别人的参考，自己不挪
+        public var fixed: Bool
+        public init(name: String, samples: [(p: Point2, f: MagneticFeature, tMs: Int64)], fixed: Bool = false) {
+            self.name = name; self.samples = samples; self.fixed = fixed
         }
     }
 
@@ -109,7 +111,7 @@ public struct SessionRegistration {
         // 轮流更新（后面的对齐到前面挪过的）实测会让一串遍一起漂走
         for _ in 0..<config.rounds {
             var next = cur
-            for k in sessions.indices where !thin[k].isEmpty {
+            for k in sessions.indices where !thin[k].isEmpty && !sessions[k].fixed {
                 let b = search(thin[k], pivot: pivots[k], ref: reference(thin, cur, excluding: k))
                 next[k].dx += config.step * (b.dx - cur[k].dx)
                 next[k].dy += config.step * (b.dy - cur[k].dy)

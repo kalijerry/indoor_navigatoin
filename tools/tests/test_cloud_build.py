@@ -144,5 +144,15 @@ class SurveySummaryTest(unittest.TestCase):
             self.assertIn("修正 2 次", cb.format_survey_summary("x", s))
 
 
+class EditsHashTest(unittest.TestCase):
+    def test_empty_is_none_and_content_decides(self):
+        from cloud_build_lib import edits_hash
+        self.assertIsNone(edits_hash([]))
+        a = [{"session": "s", "t0Ms": 1, "t1Ms": 2, "dx": 10}]
+        b = [{"dx": 10, "t1Ms": 2, "t0Ms": 1, "session": "s"}]
+        self.assertEqual(edits_hash(a), edits_hash(b))
+        self.assertNotEqual(edits_hash(a), edits_hash([dict(a[0], dx=11)]))
+
+
 if __name__ == "__main__":
     unittest.main()
