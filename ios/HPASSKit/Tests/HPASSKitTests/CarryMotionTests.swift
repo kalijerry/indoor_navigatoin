@@ -397,7 +397,51 @@ final class CarryMotionTests: XCTestCase {
         // 关着时默认值和以前一样
         XCTAssertFalse(FusionStepDetector().adaptive)
         XCTAssertEqual(FusionStepDetector().weinbergK, 0.45)
-        XCTAssertEqual(StepDetectorTuning().peakMin, 1.0)
+        XCTAssertEqual(StepDetectorTuning().peakMin, 0.7)
+    }
+
+    /// 自适应阈值下限 0.7：iPhone 端平看屏慢走的步峰小（这里滤波后 ≈ 0.85 m/s²，低于原来的下限 1.0），自适应要一步不漏，
+    /// 固定阈值 1.0 数不到；手拿着站着不动的抖动（a_dyn 峰 ≈ 0.55，实测 P90 0.64）两者都不计成步
+    func testAdaptiveStepFloorCountsLowAmplitudeWalking() {
+        func cycle(main: Double) -> [Double] {
+            var v: [Double] = []
+            for k in 0..<45 {   // 0.9 s 一步（慢走）
+                let t = Double(k) * 0.02
+                var d = 0.0
+                if t < 0.2 { d = -0.8 * main * sin(Double.pi * t / 0.2) }
+                else if t < 0.4 { d = main * sin(Double.pi * (t - 0.2) / 0.2) }
+                v.append(d)
+            }
+            let mean = v.reduce(0, +) / Double(v.count)
+            return v.map { $0 - mean }
+        }
+        func count(_ signal: (Int) -> Double, samples: Int, adaptive: Bool) -> (steps: Int, maxDyn: Double) {
+            let det = FusionStepDetector()
+            det.adaptive = adaptive
+            var steps = 0, maxDyn = 0.0
+            for i in 0..<samples {
+                let s = IMUSample(tMs: Int64(i * 20), ax: 0, ay: 0, az: FusionMath.gravity + signal(i), gx: 0, gy: 0, gz: 0, mx: 20, my: 0, mz: -40)
+                if det.update(sample: s, dt: 0.02, minStepIntervalMs: 250, maxStepLengthM: 1.0) != nil { steps += 1 }
+                if i > 150 { maxDyn = max(maxDyn, det.lastDyn) }
+            }
+            return (steps, maxDyn)
+        }
+        let c = cycle(main: 1.15)
+        let cycles = 30
+        let walkA = count({ c[$0 % c.count] }, samples: cycles * c.count, adaptive: true)
+        let walkL = count({ c[$0 % c.count] }, samples: cycles * c.count, adaptive: false)
+        XCTAssertLessThan(walkA.maxDyn, 1.0, "步峰应低于原下限：\(walkA)")
+        XCTAssertGreaterThan(walkA.maxDyn, 0.7, "步峰应高于新下限：\(walkA)")
+        XCTAssertEqual(Double(walkA.steps), Double(cycles), accuracy: 2, "自适应小步：\(walkA)")
+        XCTAssertLessThan(walkL.steps, cycles / 3, "固定阈值数不到小步：\(walkL)")
+        // 手抖：几个 1～4 Hz 的正弦叠加，峰 ≈ 0.5
+        let still: (Int) -> Double = { i in
+            let t = Double(i) * 0.02
+            return 0.22 * sin(2 * Double.pi * 1.3 * t + 0.4) + 0.18 * sin(2 * Double.pi * 2.1 * t + 1.9) + 0.1 * sin(2 * Double.pi * 3.7 * t + 0.7)
+        }
+        let stillA = count(still, samples: 1500, adaptive: true)
+        XCTAssertLessThan(stillA.maxDyn, 0.7, "\(stillA)")
+        XCTAssertEqual(stillA.steps, 0, "站着手抖不计步：\(stillA)")
     }
 
     /// 分模式 K 表接管步长，在线标定回写、持久化恢复；关着时 K 不变

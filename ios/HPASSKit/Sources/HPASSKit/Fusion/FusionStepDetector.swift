@@ -13,10 +13,15 @@ struct FusionStepEvent {
 /// 计步的自适应阈值 / 步频锁参数（`FusionStepDetector.adaptive` 打开时用）。**占位值，待自采 iPhone 数据标定。**
 public struct StepDetectorTuning {
     /// 峰值阈值 = clamp(max(peakFactor × σ_dyn(最近 sigmaWindowS 秒), rangeFactor × 最近几步的峰谷差), peakMin, peakMax)。
-    /// peakMin 取原有固定阈值 1.0：静止 / 低幅度看屏时和以前一样；幅度大（口袋、摆臂）时阈值跟着抬，脚跟触地的次峰不计成步。
+    /// 幅度大（口袋、摆臂）时阈值跟着抬，脚跟触地的次峰不计成步。
+    ///
+    /// peakMin 0.7（原来 1.0，沿用固定阈值）：iPhone 看屏走路的步峰小，只有安卓的约 1/3（a_dyn 步峰中位 1.5 vs 4.5 m/s²），
+    /// 实测自采 iPhone 步峰的 P2 ≈ 0.80、P5 ≈ 0.93～0.97，下限 1.0 会把慢走 / 端平看屏的步漏掉一截
+    /// （办公室慢走采集 19.5% 的时间「走着却没计到步」，推算距离只有真值 0.71）；手拿着站着不动的抖动峰 P90 ≈ 0.64。
+    /// 0.7 落在两者之间：办公室「走着没计到步」的时段 19.5% → 2.3%、推算尺度的会话间离散 0.24 → 0.10；安卓（步峰大，阈值由 σ / 峰谷差项决定）不受影响。
     public var peakFactor = 0.5
     public var rangeFactor = 0.35
-    public var peakMin = 1.0
+    public var peakMin = 0.7
     public var peakMax = 2.5
     /// 退出阈值 = exitRatio × 峰值阈值；谷值武装阈值 = −valleyRatio × 峰值阈值（原有 1.0 / 0.6 / −0.6 的比例）。
     public var exitRatio = 0.6

@@ -139,6 +139,17 @@ python -I -X utf8 tools/lab/office_metrics.py --track track.csv --map map.json [
 python -I -X utf8 tools/lab/bump_sync.py 盲测/imu.csv 伴随/imu.csv
 ```
 
+真实 IMU 场景差的时候，先看纯计步推算（不用磁场 / 蓝牙，起点和起步朝向同 `--oracle-start`）把误差拆成哪几项：
+
+```bash
+hpass-eval --map map.json --test test --dr-dump dr.csv [--carry-motion]
+python -I -X utf8 tools/bench/dr_decompose.py dr.csv [--per-session]
+```
+
+输出总尺度（推算路程 / 参考路程）、10 m 尺度分布和会话间离散、「参考在动、推算没动」的卡住占比（漏步）、
+起步航向偏差 / 漂移 / 转角比，以及 20 m 窗相对误差在「按会话真尺度修正」「按会话恒定航向偏差修正」后各剩多少，
+看哪一项是主要误差来源。
+
 ## 下一步
 
 - 多楼层场景：接入带气压的公开数据（IPIN 竞赛数据）后加楼层判对率，按 IPIN 口径楼层错一层罚 15 m。
