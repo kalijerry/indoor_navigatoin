@@ -141,6 +141,11 @@ public extension MagneticConfig {
             initialHeadingBiasSigmaDeg = trackingHeadingKnown ? 10 : 30
             headingBiasWalkDegPerM = d.headingBiasWalkDegPerM
             positionNoiseFraction = d.positionNoiseFraction
+            // 步长比例先验照旧 1 + N(0, 0.06)。实测（hpass-eval --odo-out 的纯推算和真值比，调参开发集）每条会话的步长比例
+            // 跨设备在 0.83（ILC 安卓）～ 1.1～1.4（iPhone）之间，但把先验放宽（对数正态 σ 0.1～0.2、或 10～35% 的宽尾）
+            // 是有赢有输的交换：ILC 真实计步错定 30% → 15%，自采商场留一法误差中位 2.8 m → 3.3～5.6 m（10～20 个种子，越宽越差，
+            // 加粒子不改善），公开计步（public/pdr）覆盖掉 5～9 个点。试过的设置没有一个两边都不输，所以不改。
+            // 同样试过、更差的：转弯时按 0.2 × 转角额外撒航向、簇半径 4 m、朝向未知时等航向收拢再报。
             initialScaleSigma = d.initialScaleSigma
             scaleWalkPerM = d.scaleWalkPerM
             convergedMagWeight = pinnedConvergedMagWeight ?? 0.2
