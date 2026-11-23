@@ -211,6 +211,8 @@ public enum SurveySegments {
         /// 比之前再减掉这段自己残留的整体偏移（中位）。办公室实测：不减的话同一遍里偏置慢慢变（2～3 µT）
         /// 就让 26 段里 21 段变黄 / 红；减了以后正常的段 17 绿、6 黄、1 红（红的那遍质量筛选也判了不合格）
         public var removeSegmentOffset = true
+        /// 两段离真值点的路程差至少这么多（m）才判谁更可能错
+        public var tieBreakM = 5.0
         public init() {}
     }
 
@@ -220,8 +222,10 @@ public enum SurveySegments {
         public var session: String
         public var samples: [(p: Point2, t: Double, v: Double)]
         public var deleted: Bool
-        public init(id: String, session: String, samples: [(p: Point2, t: Double, v: Double)], deleted: Bool) {
-            self.id = id; self.session = session; self.samples = samples; self.deleted = deleted
+        /// 这段中点离这遍最近一个真值点（起点 / 途中长按修正）走了多远（m）：越远 ARKit 累积漂移越大，越可能画偏
+        public var driftM: Double?
+        public init(id: String, session: String, samples: [(p: Point2, t: Double, v: Double)], deleted: Bool, driftM: Double? = nil) {
+            self.id = id; self.session = session; self.samples = samples; self.deleted = deleted; self.driftM = driftM
         }
     }
 
@@ -237,6 +241,10 @@ public enum SurveySegments {
         public var suggestDx: Double?
         public var suggestDy: Double?
         public var suggestResidualUT: Double?
+        /// 和对不上的段相比谁更可能错（按离真值点的路程，差 ≥ tieBreakM 才判）：true = 这段更可能错，
+        /// false = 对方更可能错，nil = 分不出 / 没有对不上的。只是参考，颜色仍按多数一致
+        public var likelyWrong: Bool? = nil
+        public var driftM: Double? = nil
     }
 
     /// 每段的评定（和输入一一对应；删掉的段也评，方便看删得对不对，但它不当别人的参考）
@@ -308,7 +316,7 @@ public enum SurveySegments {
             guard let r0 = residual(k, dx: 0, dy: 0), Double(r0.n) * step >= config.minOverlapM else {
                 let n = residual(k, dx: 0, dy: 0)?.n ?? 0
                 return Verdict(grade: .gray, overlapM: (Double(n) * step * 10).rounded() / 10, residualUT: nil, conflicts: [:],
-                               suggestDx: nil, suggestDy: nil, suggestResidualUT: nil)
+                               suggestDx: nil, suggestDy: nil, suggestResidualUT: nil, driftM: pieces[k].driftM.map { ($0 * 10).rounded() / 10 })
             }
             // 和每一段单独比（重叠够的）。评定用「至少和一半（按重叠长度算）对得上」：
             // 按残差从小到大，取累计重叠到一半的那个（加权下中位）。所以两条对不上时两条都红；
@@ -350,8 +358,19 @@ public enum SurveySegments {
                 }
                 if best.r <= r0.r * config.improve && best.r <= config.greenUT * 1.5 && (best.dx * best.dx + best.dy * best.dy).squareRoot() >= config.minSuggestCm { sug = best }
             }
+            // 谁更可能错：和对不上的各段比离真值点的路程，按重叠加权投票
+            var likely: Bool?
+            if grade != .green, let dk = pieces[k].driftM {
+                var me = 0.0, them = 0.0
+                for x in pair where x.r > config.greenUT {
+                    guard let j = pieces.firstIndex(where: { $0.id == x.id }), let dj = pieces[j].driftM else { continue }
+                    if dk - dj >= config.tieBreakM { me += Double(x.n) } else if dj - dk >= config.tieBreakM { them += Double(x.n) }
+                }
+                if me > them { likely = true } else if them > me { likely = false }
+            }
             return Verdict(grade: grade, overlapM: (Double(r0.n) * step * 10).rounded() / 10, residualUT: (score * 100).rounded() / 100,
-                           conflicts: conf, suggestDx: sug?.dx, suggestDy: sug?.dy, suggestResidualUT: sug.map { ($0.r * 100).rounded() / 100 })
+                           conflicts: conf, suggestDx: sug?.dx, suggestDy: sug?.dy, suggestResidualUT: sug.map { ($0.r * 100).rounded() / 100 },
+                           likelyWrong: likely, driftM: pieces[k].driftM.map { ($0 * 10).rounded() / 10 })
         }
     }
 

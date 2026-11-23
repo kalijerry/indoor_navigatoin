@@ -156,7 +156,7 @@ async function load() {
     const e = local.get(key(g));
     const manual = !!(e && !e.deleted) || !!g.edit;
     const T = e && !e.deleted ? fromEdit(e) : fromEdit(g.current || g.edit || g.auto);
-    const s = { i, id: g.id, session: g.session, t0Ms: g.t0Ms, t1Ms: g.t1Ms, lengthM: g.lengthM, raw: g.raw, auto: g.auto ? fromEdit(g.auto) : { ...T0 },
+    const s = { i, id: g.id, session: g.session, driftM: g.driftM ?? null, t0Ms: g.t0Ms, t1Ms: g.t1Ms, lengthM: g.lengthM, raw: g.raw, auto: g.auto ? fromEdit(g.auto) : { ...T0 },
                 T, manual, deleted: e ? !!e.deleted : g.deleted, v: g.verdict };
     s.orig = snap1(s);
     return s;
@@ -230,6 +230,17 @@ function recolor(withSuggest) {
       v.residualUT = Math.round(score * 100) / 100;
       v.grade = score <= th.greenUT ? "green" : score <= th.yellowUT ? "yellow" : "red";
       for (const x of pair.filter((x) => x.r > th.greenUT).sort((a, b) => b.r - a.r).slice(0, 5)) v.conflicts[x.id] = Math.round(x.r * 10) / 10;
+      v.partners = pair.length;
+      // 谁更可能错：离真值点（起点 / 长按修正）走得越远越可能漂偏（同 SurveySegments.consistency）
+      if (v.grade !== "green" && s.driftM != null) {
+        let me = 0, them = 0;
+        for (const x of pair) {
+          if (x.r <= th.greenUT) continue;
+          const o = st.segs.find((y) => y.id === x.id); if (!o || o.driftM == null) continue;
+          if (s.driftM - o.driftM >= 5) me += x.n; else if (o.driftM - s.driftM >= 5) them += x.n;
+        }
+        v.likelyWrong = me > them ? true : them > me ? false : null;
+      }
       if (withSuggest === k && v.grade !== "green") {
         // 不能挪出可走区域（地图有地面多边形时；同 SurveySegments.consistency）
         const inside = (dx, dy) => { if (!st.map || !st.map.floor.length) return 1; let n = 0; for (const [x, y] of P[k]) if (inFloor(x + dx, y + dy)) n++; return n / Math.max(P[k].length, 1); };
@@ -319,6 +330,12 @@ function render() {
     ctx.fillStyle = ctx.strokeStyle; ctx.beginPath(); ctx.moveTo(X(b[0]), Y(b[1]));
     ctx.lineTo(X(b[0]) - 9 * Math.cos(ang - .45), Y(b[1]) - 9 * Math.sin(ang - .45)); ctx.lineTo(X(b[0]) - 9 * Math.cos(ang + .45), Y(b[1]) - 9 * Math.sin(ang + .45)); ctx.fill();
     if (s.manual && !s.deleted) { ctx.beginPath(); ctx.arc(X(p[0][0]), Y(p[0][1]), 3.5, 0, 7); ctx.fill(); }
+    if (s.v.likelyWrong && !s.deleted) {   // 更可能是这段错：中间画个「!」
+      const m = p[p.length >> 1];
+      ctx.fillStyle = gradeCol(s.v.grade); ctx.beginPath(); ctx.arc(X(m[0]), Y(m[1]), 8, 0, 7); ctx.fill();
+      ctx.fillStyle = "#fff"; ctx.font = "bold 12px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText("!", X(m[0]), Y(m[1]) + 1);
+      ctx.textAlign = "start"; ctx.textBaseline = "alphabetic";
+    }
   }
   // 建议位置（虚线）
   if (st.sel != null) {
@@ -348,7 +365,18 @@ function renderPanel() {
   const n = { gray: 0, green: 0, yellow: 0, red: 0, deleted: 0 };
   for (const s of st.segs) n[s.deleted ? "deleted" : s.v.grade]++;
   $("legend").innerHTML = ["green", "yellow", "red", "gray"].map((g) => `<span><i class="chip" style="background:${gradeCol(g)}"></i>${GRADE[g].split(" · ")[1]} ${n[g]}</span>`).join("") +
-    `<span><i class="chip" style="border:1px dashed ${col("--gray")}"></i>删掉 ${n.deleted}</span>`;
+    `<span><i class="chip" style="border:1px dashed ${col("--gray")}"></i>删掉 ${n.deleted}</span>` +
+    (() => {
+      const live = st.segs.filter((s) => !s.deleted);
+      const lone = live.filter((s) => s.v.grade === "gray").length;
+      const tie = live.filter((s) => s.v.grade !== "green" && s.v.grade !== "gray" && (s.v.partners || 0) < 2).length;
+      const wrong = live.filter((s) => s.v.likelyWrong).length;
+      const parts = [];
+      if (wrong) parts.push(`${wrong} 段标了「!」：和它对不上的路线离起点 / 修正点更近，更可能是这段漂偏了`);
+      if (lone) parts.push(`${lone} 段只走过一遍（灰），下次采集从中间横穿或重叠走 3 m 以上就能验证`);
+      if (tie) parts.push(`${tie} 段只和 1 条路线比过、对不上，再走一条经过那里的路线就能少数服从多数`);
+      return parts.length ? `<div class="kv" style="margin-top:6px">${parts.map((x) => "· " + x).join("<br>")}</div>` : "";
+    })();
   const by = {}; for (const s of st.segs) (by[s.session] = by[s.session] || []).push(s);
   const sessInfo = Object.fromEntries((st.exp?.sessions || []).map((x) => [x.name, x]));
   $("sessions").innerHTML = Object.keys(by).map((name) => {
@@ -364,6 +392,10 @@ function renderPanel() {
   const conf = Object.entries(s.v.conflicts || {}).sort((a, b) => b[1] - a[1]);
   $("selInfo").innerHTML = `<b>${esc(short(s.session))} 第 ${s.no} 段</b> · ${s.lengthM} m${s.manual ? " · 手动摆过" : ""}${s.deleted ? " · <span class=bad>已删</span>" : ""}<br>
     <span style="color:${gradeCol(s.v.grade)}">●</span> ${GRADE[s.v.grade]}${s.v.residualUT != null ? `（残差 ${s.v.residualUT} µT，重叠 ${s.v.overlapM} m）` : s.v.overlapM ? `（重叠 ${s.v.overlapM} m，不够 ${st.exp.thresholds.minOverlapM} m）` : ""}
+    ${s.v.likelyWrong === true ? `<br><b style="color:${gradeCol(s.v.grade)}">! 更可能是这段错</b>：它离起点 / 修正点走了 ${s.driftM} m，和它对不上的路线更近` : ""}
+    ${s.v.likelyWrong === false ? `<br>对不上的路线离起点 / 修正点更远（这段 ${s.driftM} m），更可能是对方错，先看对方` : ""}
+    ${s.v.grade === "gray" && !s.deleted ? "<br>只走过一遍，没法验证。下次采集从这段中间横穿或重叠走 3 m 以上。" : ""}
+    ${s.v.grade !== "green" && s.v.grade !== "gray" && (s.v.partners || 0) < 2 ? "<br>只和 1 条路线比过，磁场本身分不出谁错：再走一条经过这里的路线来裁决。" : ""}
     ${conf.length ? `<br>对不上的：${conf.map(([id, r]) => `<a href="#" data-goto="${esc(id)}">${esc(name(id))}</a> ${r} µT`).join("、")}` : ""}`;
   const sg = $("sug");
   sg.hidden = s.v.suggestDx == null || s.deleted;

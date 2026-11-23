@@ -32,6 +32,8 @@ public struct SurveySegmentExport: Codable {
         public var auto: Transform?
         public var deleted: Bool
         public var verdict: SurveySegments.Verdict
+        /// 中点离这遍最近真值点（起点 / 长按修正）的路程（m）
+        public var driftM: Double?
     }
 
     public struct Session: Codable {
@@ -82,6 +84,19 @@ public struct SurveySegmentExport: Codable {
             let auto = autoRigid.map { k < $0.count ? tr($0[k]) : nil } ?? cur
             let samples = raw.samples[k]
             let spans = SurveySegments.split(raw.tracks[k], config: split)
+            // 离最近真值点（起点 / 途中长按修正）的路程：沿原始轨迹累积
+            let truth = s.anchors.filter { $0.kind == "start" || $0.kind == "reanchor" }.map(\.tMs).sorted()
+            let track = raw.tracks[k]
+            var cum: [Double] = [0]
+            for i in track.indices.dropFirst() { let d = track[i].p.distance(to: track[i - 1].p); cum.append(cum.last! + (d < 300 ? d : 0)) }
+            func pathAt(_ t: Int64) -> Double? {
+                guard let i = track.lastIndex(where: { $0.tMs <= t }) ?? (track.isEmpty ? nil : 0) else { return nil }
+                return cum[i]
+            }
+            func drift(_ t: Int64) -> Double? {
+                guard let a = truth.last(where: { $0 <= t }) ?? truth.first, let pa = pathAt(a), let pt = pathAt(t) else { return nil }
+                return max(0, pt - pa) / 100
+            }
             for (i, sp) in spans.enumerated() {
                 let last = i == spans.count - 1
                 let mine = samples.filter { $0.tMs >= sp.t0Ms && ($0.tMs < sp.t1Ms || (last && $0.tMs <= sp.t1Ms)) }
@@ -97,12 +112,14 @@ public struct SurveySegmentExport: Codable {
                     return p
                 }
                 let id = "\(s.name)@\(sp.t0Ms)"
-                pieces.append(.init(id: id, session: s.name, samples: th.map { (place($0.p), $0.f.total, $0.f.vertical) }, deleted: deleted))
+                pieces.append(.init(id: id, session: s.name, samples: th.map { (place($0.p), $0.f.total, $0.f.vertical) }, deleted: deleted,
+                                driftM: drift(mid)))
                 segs.append(Segment(id: id, session: s.name, t0Ms: sp.t0Ms, t1Ms: sp.t1Ms, lengthM: (sp.lengthCm / 10).rounded() / 10,
                                     raw: th.map { [($0.p.x * 10).rounded() / 10, ($0.p.y * 10).rounded() / 10,
                                                    ($0.f.total * 100).rounded() / 100, ($0.f.vertical * 100).rounded() / 100] },
                                     current: editT ?? cur, edit: editT, auto: auto, deleted: deleted,
-                                    verdict: .init(grade: .gray, overlapM: 0, residualUT: nil, conflicts: [:], suggestDx: nil, suggestDy: nil, suggestResidualUT: nil)))
+                                    verdict: .init(grade: .gray, overlapM: 0, residualUT: nil, conflicts: [:], suggestDx: nil, suggestDy: nil, suggestResidualUT: nil),
+                                    driftM: drift(mid).map { ($0 * 10).rounded() / 10 }))
             }
         }
         let verdicts = SurveySegments.consistency(pieces, config: consistency, walkable: walkable.map { w in { w.isWalkable($0) } })

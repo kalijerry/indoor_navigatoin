@@ -66,6 +66,16 @@ final class SurveySegmentsTests: XCTestCase {
         XCTAssertNotNil(three[1].conflicts["a"])
     }
 
+    func testTieBreakBlamesPathFartherFromTruthPoint() {
+        var a = piece("a", corridor, noise: 0.3, seed: 1); a.driftM = 3
+        var b = piece("b", corridor, shift: Point2(150, 0), noise: 0.3, seed: 2); b.driftM = 40
+        let r = SurveySegments.consistency([a, b])
+        XCTAssertEqual(r[0].likelyWrong, false, "\(r[0])")
+        XCTAssertEqual(r[1].likelyWrong, true, "\(r[1])")
+        b.driftM = 6   // 差不到 5 m：分不出
+        XCTAssertNil(SurveySegments.consistency([a, b])[1].likelyWrong)
+    }
+
     func testDeletedPieceIsNotAReference() {
         var bad = piece("b", corridor, shift: Point2(150, 0))
         bad.deleted = true
