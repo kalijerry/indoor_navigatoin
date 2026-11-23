@@ -950,6 +950,18 @@ final class CarryMotionTests: XCTestCase {
         }
         // 粒子后验默认不写进 K
         XCTAssertFalse(StepScaleCalibrator().learnFromPosterior)
+        // 分类器报口袋（ARKit 却跟踪正常 = 其实拿在手里，是误判）：不给口袋学 K
+        let dp = simulate(straightScript(durationS: 6, postures: [.init(fromS: 0, posture: .pocket(yawDeg: 35, thighDeg: 25))]))
+        let (pocket, _) = runEngine(dp, motionOn: true)
+        XCTAssertEqual(pocket.activeCarryMode, .pocket)
+        let c6 = StepScaleCalibrator()
+        for i in 0..<300 {
+            let s = Double(i) / 10
+            XCTAssertNil(c6.observeVisualOdometry(tMs: Int64(i * 100), ar: Point2(100 * s, 0), trackingNormal: true,
+                                                  pdr: Point2(80 * s, 0), engine: pocket))
+        }
+        XCTAssertNil(pocket.learnedStepScales[.pocket])
+        XCTAssertEqual(StepScaleCalibrator.vioModes, [.texting, .upright])
     }
 
     /// 一开始就在口袋里、起点和朝向已知：第一次判出模式不重撒，直接按口袋参数跟踪

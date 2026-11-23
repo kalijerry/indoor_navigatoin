@@ -58,6 +58,9 @@ public final class StepScaleCalibrator {
     /// 最近一次视觉里程计批次的比值（ARKit / 惯导，诊断）
     public private(set) var lastVIORatio: Double?
 
+    /// 视觉里程计标定只给这些携带姿态学 K（ARKit 能正常跟踪 = 手机拿在手里、摄像头朝前）
+    public static let vioModes: Set<CarryMode> = [.texting, .upright]
+
     private struct VIOWindow { var tMs: Int64; var ar: Point2; var pdr: Point2; var mode: CarryMode }
     private var vioWin: VIOWindow?
     private var vioLastT: Int64?
@@ -99,14 +102,16 @@ public final class StepScaleCalibrator {
     /// 视觉里程计标定：每个 ARKit 位姿（或每个惯导输出时刻配上最新的 ARKit 位姿）调一次。
     /// - ar: ARKit 水平面位置（cm，ARKit 自己的坐标系）；trackingNormal: ARKit 跟踪状态正常；
     /// - pdr: 同一时刻惯导引擎输出的推算位置（cm，`FusionOutput.position`；只用差）。
-    /// 只在携带姿态（看屏 / 竖持等）下、一个窗口内携带姿态没变时收。粒子的步长比例不动（K 更准了，粒子围着 1 的残差先验照旧）。
+    /// 只在手持看屏 / 竖持（`vioModes`）下、一个窗口内携带姿态没变时收。ARKit 跟踪正常说明摄像头看得见场景，
+    /// 这时分类器报口袋 / 包里 / 摆臂是误判；拿手持行走学到的 K 写进这些模式，真放进口袋时就用错了。
+    /// 粒子的步长比例不动（K 更准了，粒子围着 1 的残差先验照旧）。
     /// 返回这次更新进 K 的系数（没更新返回 nil）。
     @discardableResult
     public func observeVisualOdometry(tMs: Int64, ar: Point2, trackingNormal: Bool, pdr: Point2, engine: FusionEngine) -> Double? {
         let mode = engine.activeCarryMode
         defer { vioLastT = tMs }
         // 惯导输出被投影进通道（没有磁场图时的纯推算）时位移被剪过，不能拿来比
-        guard engine.config.motion.enabled, !engine.config.useCorridorConstraint, trackingNormal, mode.isCarryPosture,
+        guard engine.config.motion.enabled, !engine.config.useCorridorConstraint, trackingNormal, Self.vioModes.contains(mode),
               ar.x.isFinite, ar.y.isFinite, pdr.x.isFinite, pdr.y.isFinite else {
             vioWin = nil
             return nil
