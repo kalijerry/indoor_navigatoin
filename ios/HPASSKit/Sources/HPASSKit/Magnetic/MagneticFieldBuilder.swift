@@ -131,12 +131,17 @@ public final class MagneticFieldBuilder {
 
     /// 生成地图。样本不足的格子用周围有效格子反距离加权补齐（半径内），补出来的格子标准差放大。
     /// 空格子怎么补：反距离加权，或高斯过程（局部，最近 12 个有数据的格子）
-    public enum FillMethod { case idw, gp }
-    public var fillMethod: FillMethod = .gp
+    public enum FillMethod: String { case idw, gp }
+    public var fillMethod: FillMethod = MagneticFieldBuilder.defaultFillMethod
     /// 高斯过程的相关长度（cm）：磁场在多远内是相关的
-    public var gpLengthCm = 100.0
+    public var gpLengthCm = MagneticFieldBuilder.defaultGPLengthCm
+    /// 评估 / 实验用的全局默认（hpass-eval 的命令行开关改它们；产品不改）
+    nonisolated(unsafe) public static var defaultFillMethod: FillMethod = .gp
+    nonisolated(unsafe) public static var defaultGPLengthCm = 100.0
+    nonisolated(unsafe) public static var defaultFillRadiusCm = 150.0
 
-    public func build(minSamples: Int = 5, fillRadiusCm: Double = 150, sigmaFloorUT: Double = 0.5) -> MagneticFieldMap {
+    public func build(minSamples: Int = 5, fillRadiusCm: Double? = nil, sigmaFloorUT: Double = 0.5) -> MagneticFieldMap {
+        let fillRadiusCm = fillRadiusCm ?? Self.defaultFillRadiusCm
         var cells = [MagneticFeature?](repeating: nil, count: cols * rows)
         var sigmas = [MagneticFeature?](repeating: nil, count: cols * rows)
         func sigma(_ k: Int, _ c: Int) -> Double {

@@ -383,11 +383,19 @@ public enum SessionEvaluator {
         /// 地图在参考位置的均值 / 标准差；nil = 那里没数据
         public var mean: MagneticFeature?
         public var sigma: MagneticFeature?
+        /// 参考位置（地图坐标，cm）
+        public var reference: Point2 = .zero
     }
 
-    public static func residualSamples(dir: URL, field: MagneticFieldMap, everyCm: Double = 50) throws -> [ResidualSample] {
-        let s = try SurveySessionLoader.load(dir)
-        guard let ref = Self.loadTruth(dir) else { return [] }
+    /// - map: 给了时，没有 truth.csv 的会话（自采建图会话，留一法）用它自己的对齐结果（锚点 + 贴通道）当参考，和 evaluate 一样
+    public static func residualSamples(dir: URL, field: MagneticFieldMap, map: StoreMap? = nil, everyCm: Double = 50) throws -> [ResidualSample] {
+        let truth = Self.loadTruth(dir)
+        let s = try SurveySessionLoader.load(dir, requireAnchors: truth == nil, mapOriginOffsetCm: map?.originOffsetCm ?? .zero)
+        var ref: [(tMs: Int64, p: Point2)]
+        if let truth { ref = truth } else if let map {
+            ref = SurveyMapBuilder(widthCm: map.width, heightCm: map.height, crosses: map.crosses).add(s).track
+        } else { return [] }
+        guard ref.count > 1 else { return [] }
         func refAt(_ t: Int64) -> Point2? {
             var lo = 0, hi = ref.count - 1
             guard hi > 0, t >= ref[0].tMs, t <= ref[hi].tMs else { return nil }
@@ -415,7 +423,7 @@ public enum SessionEvaluator {
                 nextAt = path + everyCm
                 guard let f = sh.latestFeature, let r = refAt(p.tMs) else { continue }
                 let m = field.sample(at: r)
-                out.append(ResidualSample(tMs: p.tMs, pathCm: path, feature: f, mean: m?.mean, sigma: m?.sigma))
+                out.append(ResidualSample(tMs: p.tMs, pathCm: path, feature: f, mean: m?.mean, sigma: m?.sigma, reference: r))
             }
         }
         return out
