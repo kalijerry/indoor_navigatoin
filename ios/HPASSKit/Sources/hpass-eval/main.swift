@@ -17,6 +17,7 @@ import HPASSKit
 //                                 没有 truth.csv 的会话用它自己的锚点对齐当参考（留一法，tools/bench/map_cv.py 用）
 //   --field-out field.json        把建好的磁场图（magField 节点）写出来
 //   --fill-radius cm / --gp-length cm / --fill gp|idw   磁场图补空格的试验开关（默认 = 产品设置 150 / 100 / gp）
+//   --no-tracking-calibration / --tracking-temperature T   跟踪似然的地图标定：不标定（老地图）/ 直接给温度（默认建图会话两折交叉验证标定）
 
 func arg(_ name: String) -> String? {
     guard let i = CommandLine.arguments.firstIndex(of: name), i + 1 < CommandLine.arguments.count else { return nil }
@@ -76,7 +77,20 @@ do {
     if let v = arg("--gp-length").flatMap(Double.init) { MagneticFieldBuilder.defaultGPLengthCm = v }
     let built = try SessionEvaluator.buildMaps(sessions: build, map: map, mode: mapMode, tagPositions: refTags ?? [:],
                                                withWiFi: useWiFi)
-    let field = built.field, bleMap = built.ble
+    var field = built.field
+    let bleMap = built.ble
+    // 跟踪似然的地图标定（和 hpass-build 出图时同一份，见 SessionEvaluator.trackingCalibration）。只有已知起点的跟踪用得到，
+    // 冷启动不算（省时间）。--tracking-temperature T 直接给（≤ 0 = 不标定），--no-tracking-calibration = 老地图（不带标定）
+    if let v = arg("--tracking-temperature").flatMap(Double.init) {
+        field.trackingTemperature = v > 0 ? v : nil
+    } else if CommandLine.arguments.contains("--oracle-start") && !CommandLine.arguments.contains("--no-tracking-calibration") {
+        let cal = SessionEvaluator.trackingCalibration(sessions: build, map: map, mode: mapMode, tagPositions: refTags ?? [:])
+        field.trackingTemperature = cal?.temperature
+        let per = cal?.perDistance.map { String(format: "%.1f m：%d 窗、LLR %.2f、T %.1f", $0.distanceCm / 100, $0.windows, $0.meanLLR, $0.temperature) }
+        print("跟踪似然标定：" + (cal.map { String(format: "温度 %.1f", $0.temperature)
+            + ($0.temperature <= TrackingCalibration.maxTemperature ? "（计步跟踪用粒子偏移似然）" : "（超过 \(Int(TrackingCalibration.maxTemperature))，照旧）") } ?? "没标定")
+              + (per.map { "；" + $0.joined(separator: "，") } ?? ""))
+    }
     for r in built.reports {
         let off = r.offsetUT.map { String(format: "，偏移 |B| %+.1f Bz %+.1f Bh %+.1f µT", $0.total, $0.vertical, $0.horizontal) } ?? ""
         print("建图 \(r.name)：样本 \(r.samplesUsed)" + off + (r.warnings.isEmpty ? "" : "，⚠️ \(r.warnings.joined(separator: "；"))"))
@@ -90,6 +104,7 @@ do {
         summary += built.magExcluded.isEmpty ? "（仍在磁场图里；云端出图会排除）" : "（磁场图没用）"
     }
     summary += "，磁场 \(field.coveredCells) 格"
+    if let t = field.trackingTemperature { summary += String(format: "，跟踪似然标定温度 %.1f", t) }
     print(summary)
     print("磁场图：有数据 \(field.coveredCells) 格；蓝牙指纹：\(bleMap.map { "\($0.tags.count) 个标签" } ?? "无")")
     if useWiFi {
@@ -178,6 +193,12 @@ do {
                 if let v = arg("--obs-sigma-floor").flatMap(Double.init) { cfg.observationSigmaFloorUT = v }
                 if let v = arg("--mag-corr-cm").flatMap(Double.init) { cfg.magneticCorrelationCm = v }
                 if let v = arg("--converged-mag-weight").flatMap(Double.init) { cfg.convergedMagWeight = v }
+                // 每个粒子自己估偏移（MagneticConfig.particleOffsetFilter）的试验开关
+                // （只改跟踪配置档：冷启动的配置档不动）
+                if cfg.trackingOdometry != nil, let v = arg("--particle-offset").flatMap(Int.init) { cfg.particleOffsetFilter = v != 0 }
+                if let v = arg("--po-q").flatMap(Double.init) { cfg.particleOffsetWalkVarUT2 = v }
+                if let v = arg("--po-r").flatMap(Double.init) { cfg.particleOffsetWhiteVarUT2 = v }
+                if let v = arg("--po-temp").flatMap(Double.init) { cfg.particleOffsetTemperature = v }
                 if let v = arg("--offset-warmup").flatMap(Int.init) { cfg.offsetWarmupUpdates = v }
                 if let v = arg("--offset-window").flatMap(Int.init) { cfg.offsetMedianWindow = v }
                 if let v = arg("--lost-updates").flatMap(Int.init) { cfg.lostUpdates = v }

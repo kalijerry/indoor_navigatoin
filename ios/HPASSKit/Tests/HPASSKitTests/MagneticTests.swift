@@ -84,6 +84,11 @@ final class MagneticTests: XCTestCase {
         let back = try XCTUnwrap(try StoreDataLoader.loadMagneticField(data))
         XCTAssertEqual(back.cols, map.cols)
         XCTAssertEqual(back.coveredCells, map.coveredCells)
+        XCTAssertNil(back.trackingTemperature)              // 没标定的图不写这一项，读回来也没有
+        var cal = map
+        cal.trackingTemperature = 3.456
+        let d2 = try JSONSerialization.data(withJSONObject: ["width": 1000, "height": 1000, "mapElementList": [Any](), "magField": cal.jsonObject()])
+        XCTAssertEqual(try XCTUnwrap(try StoreDataLoader.loadMagneticField(d2)).trackingTemperature ?? 0, 3.46, accuracy: 1e-9)
         XCTAssertEqual(try StoreDataLoader.loadMarkPoints(data), [MarkPoint(id: "1", x: 100, y: 200)])
         let none = try JSONSerialization.data(withJSONObject: ["width": 1000, "height": 1000, "mapElementList": [Any]()])
         XCTAssertNil(try StoreDataLoader.loadMagneticField(none))

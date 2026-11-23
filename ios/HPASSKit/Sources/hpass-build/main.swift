@@ -161,6 +161,17 @@ do {
             print("磁场图：并入实时数据后 \(rm.field.coveredCells) 格")
         }
     }
+    // 跟踪似然的地图标定：进了磁场图的会话两折交叉验证（和评估同一份，见 SessionEvaluator.trackingCalibration），
+    // 写进磁场图 / 地图包说明，手机计步跟踪按它决定用不用粒子偏移似然、用多大温度。会话不到 2 个 / 标不出来就不写（照旧）
+    let magNames = Set(rm.sessions.map(\.name))
+    let calDirs = dirs.filter { magNames.contains($0.lastPathComponent) }
+    if let cal = SessionEvaluator.trackingCalibration(sessions: calDirs, map: map, tagPositions: tagPos) {
+        rm.field.trackingTemperature = cal.temperature
+        print(String(format: "跟踪似然标定：温度 %.1f", cal.temperature)
+              + (cal.temperature <= TrackingCalibration.maxTemperature ? "（计步跟踪用粒子偏移似然）" : "（图上米级信息太少，跟踪照旧）"))
+    } else {
+        print("跟踪似然标定：没标定（会话不到 2 个或窗口不够），跟踪照旧")
+    }
     // 蓝牙指纹
     let bb = BLEFingerprintBuilder(widthCm: map.width, heightCm: map.height)
     if let p = arg("--tag-ids") ?? arg("--esl-ids"), let t = try? String(contentsOfFile: p, encoding: .utf8) { bb.whitelist = BLEFingerprintBuilder.parseIdList(t) }

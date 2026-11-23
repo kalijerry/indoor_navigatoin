@@ -26,6 +26,8 @@ public enum OdometrySource: String, CaseIterable {
 ///   （`coverageGatedMagWeight`）：一段没采过的路上完全靠推算；
 /// - 地磁似然按实测残差标定（`TrackingProfile.observationSigmaFloorUT` / `magneticCorrelationCm`），
 ///   整体偏移不用单次读数估，攒够一段再取中位数（`offsetWarmupUpdates`）；
+///   地图带了跟踪似然标定（`MagneticFieldMap.trackingTemperature`）时，计步跟踪改用每个粒子自己估偏移的似然
+///   （`particleOffsetFromMap`），强度按这张图标定；
 /// - 蓝牙只做软约束（`bleSoftTracking`，底图学过本场地标签范围时；人工打点的标签表底图照旧硬约束）：
 ///   有上限的软范围约束，不挡收敛；持续对不上先局部找回，找回后蓝牙还是不认再升级成全图找。
 ///
@@ -111,6 +113,9 @@ public extension MagneticConfig {
         c.magneticCorrelationCm = TrackingProfile.magneticCorrelationCm
         c.offsetWarmupUpdates = TrackingProfile.offsetWarmupUpdates
         c.offsetMedianWindow = TrackingProfile.offsetMedianWindow
+        // 地图带跟踪似然标定（建图时交叉验证量出，见 TrackingCalibration）时，计步跟踪改用「每个粒子自己估偏移」的似然，
+        // 温度取地图的；没标定 / 标出来图上没有米级信息的照旧用上面这套
+        c.particleOffsetFromMap = true
         c.lostConfidence = TrackingProfile.lostConfidence
         c.lostConfidenceWithExternalPrior = TrackingProfile.lostConfidenceWithExternalPrior
         c.bleSoftTracking = true
