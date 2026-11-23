@@ -98,9 +98,9 @@ do {
         print("手动分段修改：\(es.edits.filter { !$0.isDeleted }.count) 段摆过、\(es.edits.filter(\.isDeleted).count) 段删掉（涉及 \(sessionEdits.count) 遍）")
     }
     /// 分段导出 + 一致性着色（看板「路线」页）：全部没过质量筛选也导出，用户才能在看板上看到哪段不对、改了再建
-    func exportSegments(rigid: [SessionRegistration.Rigid?], autoRigid: [SessionRegistration.Rigid?]? = nil, quality: [SessionQualityGate.Report]) throws -> [String: Int]? {
+    func exportSegments(rigid: [SessionRegistration.Rigid?], autoRigid: [SessionRegistration.Rigid?]? = nil, segmentAuto: [String: [SurveySegments.Edit]] = [:], quality: [SessionQualityGate.Report]) throws -> [String: Int]? {
         guard let so = arg("--segments-out") else { return nil }
-        let ex = SurveySegmentExport.build(mapId: id, fusion: fusion, sessions: sessions, rigid: rigid, autoRigid: autoRigid, quality: quality, edits: editSet, walkable: SessionEvaluator.walkable(map))
+        let ex = SurveySegmentExport.build(mapId: id, fusion: fusion, sessions: sessions, rigid: rigid, autoRigid: autoRigid, segmentAuto: segmentAuto, quality: quality, edits: editSet, walkable: SessionEvaluator.walkable(map))
         let enc = JSONEncoder(); enc.outputFormatting = [.sortedKeys]
         try enc.encode(ex).write(to: URL(fileURLWithPath: so))
         print("路线分段：\(ex.segments.count) 段，" + ["green": "绿", "yellow": "黄", "red": "红", "gray": "灰（没和别的路线重叠）", "deleted": "已删"]
@@ -139,7 +139,7 @@ do {
     }
     let quality = pb.quality
     let corrStats = pb.corrections
-    let segmentCounts = try exportSegments(rigid: pb.rigid, autoRigid: pb.autoRigid, quality: pb.quality)
+    let segmentCounts = try exportSegments(rigid: pb.rigid, autoRigid: pb.autoRigid, segmentAuto: pb.segmentAuto, quality: pb.quality)
     for q in quality {
         let ble = q.bleMedianM.map { String(format: "标签 %.1f m（最差 %.1f）", $0, q.bleWorstM ?? 0) } ?? "标签 -"
         let mag = q.magResidualUT.map { String(format: "磁场残差 %.1f µT（最差 %.1f）", $0, q.magWorstUT ?? 0) } ?? "磁场 -"

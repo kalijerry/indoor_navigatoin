@@ -65,6 +65,7 @@ public struct SurveySegmentExport: Codable {
     /// - edits: 后台存的手动修改
     public static func build(mapId: String, fusion: MultiSessionFusion, sessions: [SurveySession],
                              rigid allRigid: [SessionRegistration.Rigid?], autoRigid: [SessionRegistration.Rigid?]? = nil,
+                             segmentAuto: [String: [SurveySegments.Edit]] = [:],
                              quality qualityReports: [SessionQualityGate.Report],
                              edits: SurveySegments.EditSet?, walkable: WalkableMap? = nil,
                              split: SurveySegments.SplitConfig = .init(),
@@ -106,8 +107,11 @@ public struct SurveySegmentExport: Codable {
                 let pin = ed?.pinned(mid)
                 let deleted = ed?.deleted(mid) ?? false
                 let editT = pin.map { Transform(dx: $0.dx, dy: $0.dy, rotDeg: $0.rotDeg, pivotX: $0.pivotX, pivotY: $0.pivotY) }
+                let segAuto = segmentAuto[s.name]?.first { $0.contains(mid) }
+                let segAutoT = segAuto.map { Transform(dx: $0.dx, dy: $0.dy, rotDeg: $0.rotDeg, pivotX: $0.pivotX, pivotY: $0.pivotY) }
                 func place(_ p: Point2) -> Point2 {
                     if let e = pin { return e.apply(p) }
+                    if let e = segAuto { return e.apply(p) }
                     if let r = rigid, !r.isIdentity { return r.apply(p) }
                     return p
                 }
@@ -117,7 +121,7 @@ public struct SurveySegmentExport: Codable {
                 segs.append(Segment(id: id, session: s.name, t0Ms: sp.t0Ms, t1Ms: sp.t1Ms, lengthM: (sp.lengthCm / 10).rounded() / 10,
                                     raw: th.map { [($0.p.x * 10).rounded() / 10, ($0.p.y * 10).rounded() / 10,
                                                    ($0.f.total * 100).rounded() / 100, ($0.f.vertical * 100).rounded() / 100] },
-                                    current: editT ?? cur, edit: editT, auto: auto, deleted: deleted,
+                                    current: editT ?? segAutoT ?? cur, edit: editT, auto: segAutoT ?? auto, deleted: deleted,
                                     verdict: .init(grade: .gray, overlapM: 0, residualUT: nil, conflicts: [:], suggestDx: nil, suggestDy: nil, suggestResidualUT: nil),
                                     driftM: drift(mid).map { ($0 * 10).rounded() / 10 }))
             }
