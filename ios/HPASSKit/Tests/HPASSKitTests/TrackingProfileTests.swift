@@ -444,9 +444,10 @@ final class TrackingProfileTests: XCTestCase {
         var cfg = MagneticConfig.liveColdStart(visualOdometry: false, mapAreaM2: 240)
         cfg.coldStartParticleCount = 3000
         cfg.coldChallengerParticleCount = 3000
+        // 走 50 m（x 400 → 5400 cm），留在 60 m 走廊里：走出地图后收敛状态取决于浮点细节，macOS / Linux 会不一样
         func walk(_ l: MagneticLocalizer, prior: Bool = false) {
             var truth = Point2(400, 200)
-            for k in 0..<400 {
+            for k in 0..<200 {
                 truth = truth + Point2(25, 0)
                 if prior && k % 4 == 0 { l.applyPositionPrior(truth, sigmaCm: 300, weight: 1) }
                 l.step(delta: pdr(Point2(25, 0)), feature: g(truth.x))
