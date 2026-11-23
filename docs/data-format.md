@@ -112,7 +112,7 @@ point_id,x_cm,y_cm,t_start_ms,t_end_ms,note
 | 文件 | 列 | 频率 | 说明 |
 |---|---|---|---|
 | `arkit_pose.csv` | `t_ms,x_m,y_m,z_m,qx,qy,qz,qw,tracking,limited_reason` | ≈30 Hz | ARKit 世界跟踪位姿。世界系重力对齐，x 右、y 上、z 朝向观察者；俯视时 (x, z) 与地图 (x, y) 手性相同。`tracking`：0 不可用、1 受限、2 正常；`limited_reason`：1 初始化、2 运动过快、3 特征不足、4 重定位、9 其他 |
-| `anchors.csv` | `t_ms,kind,map_x_cm,map_y_cm,ar_x_cm,ar_z_cm,heading_rad,note` | 事件 | 操作者在 App 里长按地图记下的已知位置。`kind`：`start` 起点；`reanchor` 走动中的修正；`heading` 设朝向（记的是当时的估计位置，**不是真值**）；`end` 结束时的估计位置（**不是真值**）。`ar_*` 是同一时刻 ARKit 的 (x, z)，单位 cm |
+| `anchors.csv` | `t_ms,kind,map_x_cm,map_y_cm,ar_x_cm,ar_z_cm,heading_rad,note` | 事件 | 操作者在 App 里长按地图记下的已知位置。`kind`：`start` 起点；`reanchor` 走动中的修正；`heading` 设朝向（记的是当时的估计位置，**不是真值**）；`end` 结束时的估计位置（**不是真值**）。`checkpoint` 精度实验的过点打卡（地图坐标 = 长按的已知点，**是真值**，但**不参与对齐**；`note` 里有当时 App 估计的位置「估计 x y 偏 N cm」；`meta.json` 里 `checkpoint_mode: true`）。`ar_*` 是同一时刻 ARKit 的 (x, z)，单位 cm |
 
 | `quality.json` | `CollectionQualityMonitor.Summary` | 结束时 | 采集时质量打分（10 秒一段，和云端 `SessionQualityGate` 同一套阈值）：`score` 0～100、`grade` 好 / 一般 / 差、`kept`、`reason`、`droppedSpansMs`（差段连同前后各一段，绝对毫秒）、`autoStopped` / `stopReason`、`windowList`（每段的分数和问题）。读会话（`SurveySessionLoader`，手机建图和 hpass-build 同一入口）时 `droppedSpansMs` 里的磁场和蓝牙样本不用；`kept = false` 的会话 App 不上传、手机建图不列出、`cloud_build.py` / hpass-build 跳过。没有这个文件（旧会话）= 全部照用 |
 
