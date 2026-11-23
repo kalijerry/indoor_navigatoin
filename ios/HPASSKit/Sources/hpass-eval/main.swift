@@ -16,6 +16,16 @@ import HPASSKit
 //   --residuals res.csv           只导出测试会话「实测特征 vs 地图在参考位置」的残差（含参考坐标），不跑定位；
 //                                 没有 truth.csv 的会话用它自己的锚点对齐当参考（留一法，tools/bench/map_cv.py 用）
 //   --field-out field.json        把建好的磁场图（magField 节点）写出来
+//   --carry-k                     pdr-imu + --carry-motion 时按 App 的做法跨会话带着在线标定学到的分模式步长 K（StepScaleStore）：
+//                                 测试会话按开始时间排序依次回放，第 k 次回放的每个会话从前一个会话结束时学到的 K 开始
+//                                 （第一个会话从 --k-state 读到的、或空 = App 第一次用）。报告带 sequenceIndex
+//   --k-state k.json              --carry-k 的初始 / 结束状态（每次回放一份；文件存在就先读，回放完写回）：留一法逐折串起来用
+//   --vio-k                       --carry-k 时每个测试会话回放（摄像头关）之后，再用它自己的 ARKit 位姿按 App 的视觉里程计标定
+//                                 学一遍 K（这段路当时若是开着摄像头增强定位，App 会学到的；App 测绘时不学 K），带给下一个会话。合成位姿（公开数据集）别用
+//   --posterior-k                 对照：按原来的做法把粒子步长比例后验写进 K（StepScaleCalibrator.learnFromPosterior）
+//   --step-scale x                诊断：惯导步长整体乘 x（FusionConfig.stepLengthScale）
+//   --odo-out odo.csv             诊断：每个运动节拍一行纯推算位置（pdr-imu：惯导输出；poses：只转了方向的位姿）+ 参考 + 估计
+//                                 + 粒子步长比例的加权中位数 / 标准差 + 生效的步长 K
 //   --fill-radius cm / --gp-length cm / --fill gp|idw   磁场图补空格的试验开关（默认 = 产品设置 150 / 100 / gp）
 //   --no-tracking-calibration / --tracking-temperature T   跟踪似然的地图标定：不标定（老地图）/ 直接给温度（默认建图会话两折交叉验证标定）
 
@@ -145,7 +155,8 @@ do {
     }
     // --rooms：办公室地图（有单元 / 门 / 墙）用房间约束（不经门不能换房间）并在估计里带房间，见 RoomGraph
     let useRooms = CommandLine.arguments.contains("--rooms")
-    let walk = SessionEvaluator.walkable(map, rooms: useRooms)
+    // --no-walkable：诊断，粒子滤波不用可走区域（不撞墙、没有通道走向先验），看墙对某个量（例如步长比例后验）的影响
+    let walk = CommandLine.arguments.contains("--no-walkable") ? nil : SessionEvaluator.walkable(map, rooms: useRooms)
     if useRooms { print(walk?.rooms.map { "房间约束：\($0.rooms.count) 个单元、\($0.doors.count) 扇门、\($0.openSeams) 段没墙的分界" } ?? "房间约束：地图没有单元，不用") }
     var out: [EvalReport] = []
     // 粒子滤波有随机性（加上字典遍历顺序每次不同），单次结果波动很大：--runs N 跑 N 次（不同随机种子），报中位和范围
@@ -171,17 +182,37 @@ do {
     let diagOut = arg("--diag-out")
     if diagOut != nil { SessionEvaluator.trackDiagnostics = true }
     var diagLines = ["session,run,t_ms,est_x,est_y,converged,unc_cm,ref_x,ref_y,confidence,spread_cm,heading_spread_deg,scale_median,scale_sigma,odo_x,odo_y,heading_hist,spread_est_cm,mean_x,mean_y"]
-    var odoLines = ["session,run,t_ms,odo_x,odo_y,ref_x,ref_y,est_x,est_y,converged,unc_cm"]
+    var odoLines = ["session,run,t_ms,odo_x,odo_y,ref_x,ref_y,est_x,est_y,converged,unc_cm,scale_med,scale_sigma,step_k"]
     var trackLines = ["session,run,t_ms,est_x,est_y,converged,unc_cm,ref_x,ref_y,room_id,room_mass,carry_mode,frozen"]
     let carryMotion = CommandLine.arguments.contains("--carry-motion")
     let stationaryFreeze = CommandLine.arguments.contains("--stationary-freeze")
     if motion == .pdrIMU && (carryMotion || stationaryFreeze) {
         print("运动模型：" + [carryMotion ? "携带无关（按携带模式重撒 + K 在线标定）" : nil, stationaryFreeze ? "静止冻结" : nil].compactMap { $0 }.joined(separator: "，"))
     }
-    for t in test {
+    // --carry-k：测试会话按开始时间（imu.csv 第一个时刻）排序，每次回放各自带着学到的 K 往下传
+    let carryK = CommandLine.arguments.contains("--carry-k")
+    let vioK = CommandLine.arguments.contains("--vio-k")
+    let fixedStepScale = arg("--step-scale").flatMap(Double.init) ?? 1
+    struct KState: Codable { var sessions = 0; var runs: [String: [String: Double]] = [:] }
+    var kState = KState()
+    let kStatePath = arg("--k-state")
+    if let p = kStatePath, let d = FileManager.default.contents(atPath: p), let st = try? JSONDecoder().decode(KState.self, from: d) {
+        kState = st
+    }
+    func firstImuMs(_ u: URL) -> Int64 {
+        guard let txt = try? String(contentsOf: u.appendingPathComponent("imu.csv"), encoding: .utf8) else { return 0 }
+        let lines = txt.split(separator: "\n", maxSplits: 2)
+        return lines.count > 1 ? Int64(lines[1].split(separator: ",").first ?? "") ?? 0 : 0
+    }
+    let orderedTest = carryK ? test.sorted { (firstImuMs($0), $0.lastPathComponent) < (firstImuMs($1), $1.lastPathComponent) } : test
+    if carryK { print("跨会话带 K：\(orderedTest.count) 个测试会话按时间顺序回放（之前已回放 \(kState.sessions) 个）") }
+    for (ti, t) in orderedTest.enumerated() {
         var rs: [EvalReport] = []
         for k in 0..<runs {
-            let r = try SessionEvaluator.evaluate(dir: t, map: map, field: field, ble: ble, walkable: walk,
+            let kIn: [CarryMode: Double] = carryK
+                ? Dictionary(uniqueKeysWithValues: (kState.runs[String(k + 1)] ?? [:]).compactMap { kv in CarryMode(rawValue: kv.key).map { ($0, kv.value) } })
+                : [:]
+            var r = try SessionEvaluator.evaluate(dir: t, map: map, field: field, ble: ble, walkable: walk,
                                                   crossCheck: !CommandLine.arguments.contains("--no-crosscheck"), configure: { cfg in
                 if CommandLine.arguments.contains("--offset") { cfg.offsetInvariant = true }
                 if CommandLine.arguments.contains("--hybrid") { cfg.hybridOffset = true }
@@ -247,6 +278,9 @@ do {
                                                   coldStartGate: CommandLine.arguments.contains("--cold-gate"),
                                                   wifi: useWiFi ? built.wifi : nil, motion: motion, startHeading: startHeading,
                                                   carryMotion: carryMotion, stationaryFreeze: stationaryFreeze,
+                                                  stepLengthScale: fixedStepScale, learnedStepScales: kIn,
+                                                  scaleDiagnostics: odoOut != nil,
+                                                  posteriorStepScale: CommandLine.arguments.contains("--posterior-k"),
                                                   onTrack: trackOut == nil && odoOut == nil && diagOut == nil ? nil : { p in
                 func f1(_ v: Double?) -> String { v.map { String(format: "%.1f", $0) } ?? "" }
                 func f3(_ v: Double?) -> String { v.map { String(format: "%.3f", $0) } ?? "" }
@@ -260,12 +294,30 @@ do {
                 }
                 if odoOut != nil, let o = p.odometry {
                     odoLines.append("\(t.lastPathComponent),\(k + 1),\(p.tMs),\(f1(o.x)),\(f1(o.y)),\(f1(p.reference.x)),\(f1(p.reference.y)),"
-                                    + "\(f1(p.estimate?.x)),\(f1(p.estimate?.y)),\(p.converged ? 1 : 0),\(f1(p.uncertaintyCm.flatMap { $0.isFinite ? $0 : nil }))")
+                                    + "\(f1(p.estimate?.x)),\(f1(p.estimate?.y)),\(p.converged ? 1 : 0),\(f1(p.uncertaintyCm.flatMap { $0.isFinite ? $0 : nil })),"
+                                    + [p.scaleMedian, p.scaleSigma, p.stepK].map { $0.map { String(format: "%.4f", $0) } ?? "" }.joined(separator: ","))
                 }
                 trackLines.append("\(t.lastPathComponent),\(k + 1),\(p.tMs),\(f1(p.estimate?.x)),\(f1(p.estimate?.y)),"
                                   + "\(p.converged ? 1 : 0),\(f1(p.uncertaintyCm.flatMap { $0.isFinite ? $0 : nil })),\(f1(p.reference.x)),\(f1(p.reference.y)),"
                                   + "\(p.roomId ?? ""),\(p.roomId == nil ? "" : String(format: "%.3f", p.roomMass)),\(p.carryMode.rawValue),\(p.frozen ? 1 : 0)")
             })
+            if carryK {
+                r.sequenceIndex = kState.sessions + ti
+                var kOut = r.learnedStepScales ?? [:]
+                if vioK {
+                    let start = Dictionary(uniqueKeysWithValues: kOut.compactMap { kv in CarryMode(rawValue: kv.key).map { ($0, kv.value) } })
+                    let v = try SessionEvaluator.learnStepScalesFromVIO(dir: t, initial: start)
+                    kOut = Dictionary(uniqueKeysWithValues: v.scales.map { ($0.key.rawValue, $0.value) })
+                    print("  [K] \(t.lastPathComponent) 视觉里程计标定 \(v.updates) 次，比值 "
+                          + v.ratios.map { String(format: "%.3f", $0) }.joined(separator: " "))
+                }
+                kState.runs[String(k + 1)] = kOut
+                func fmt(_ d: [String: Double]) -> String {
+                    d.keys.sorted().map { key in key + " " + String(format: "%.3f", d[key]!) }.joined(separator: " ")
+                }
+                let kInS = Dictionary(uniqueKeysWithValues: kIn.map { ($0.key.rawValue, $0.value) })
+                print("  [K] \(t.lastPathComponent) 第 \(k + 1) 次：开始 \(fmt(kInS)) → 结束 \(fmt(kOut))（吸收 \(r.stepScaleAbsorbed ?? 0) 次）")
+            }
             if runs == 1 { print(r.line) }
             rs.append(r)
         }
@@ -308,6 +360,11 @@ do {
     }
     let all = out.compactMap(\.medianCm)
     if all.count > 1 { print(String(format: "测试会话中位误差的中位：%.0f cm", all.sorted()[all.count / 2])) }
+    if carryK, let p = kStatePath {
+        kState.sessions += orderedTest.count
+        let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try enc.encode(kState).write(to: URL(fileURLWithPath: p))
+    }
     if let p = odoOut {
         try (odoLines.joined(separator: "\n") + "\n").write(toFile: p, atomically: true, encoding: .utf8)
         print("纯推算轨迹已写到 \(p)（\(odoLines.count - 1) 行）")

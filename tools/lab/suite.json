@@ -64,7 +64,7 @@
       "track": {"title": "全部建图会话融合 → 已知起点跟踪（App 实时定位的跟踪配置档 MagneticConfig.tracking）", "flags": ["--oracle-start"]},
       "leave-one-out": {"title": "留一法：其余建图会话建图 → 留下那次的真实 IMU 计步回放（不用专门走测试）",
                         "flags": ["--motion", "pdr-imu", "--carry-motion", "--rooms", "--stationary-freeze", "--no-ble"],
-                        "track_flags": ["--oracle-start"], "cold_flags": [], "gate": false},
+                        "track_flags": ["--oracle-start"], "cold_flags": [], "chain_flags": ["--carry-k", "--vio-k"], "gate": false},
       "office-carry": {"title": "办公室盲测（摄像头关、按携带方式带）· 真实 IMU 计步 · 双机真值",
                        "flags": ["--motion", "pdr-imu", "--carry-motion", "--rooms", "--stationary-freeze"], "track_flags": [], "cold_flags": ["--no-mag-only-cold-fix"]}
     },

@@ -312,6 +312,39 @@ class SimAndLooTests(unittest.TestCase):
             self.assertEqual(r["loo_folds"], 3)
 
 
+    def test_loo_chain_runs_folds_chronologically_with_k_state(self):
+        tmp = Path(tempfile.mkdtemp())
+        work = tmp / "work"
+        d = work / "private" / "site-x"
+        for name, t0 in (("a", 3000), ("b", 1000), ("c", 2000)):     # 开始时间：b < c < a
+            (d / "build" / name).mkdir(parents=True)
+            (d / "build" / name / "imu.csv").write_text(f"t_ms,ax\n{t0},0\n")
+        (d / "map.json").write_text("{}")
+        (work / "private" / "manifest.json").write_text(json.dumps([{"label": "site-x", "build": ["a", "b", "c"], "test": [], "loo": True}]))
+        log = tmp / "calls.jsonl"
+        fake = tmp / "fake_eval.py"
+        fake.write_text(FAKE_EVAL + textwrap.dedent(f"""
+            with open({str(log)!r}, "a") as f:
+                f.write(json.dumps(a[1:]) + "\\n")
+        """))
+        suite = {"runs": {"pr": 1}, "datasets": {}, "scenarios": [],
+                 "private": {"tiers": ["pr"], "gate": True, "protocols": {
+                     "leave-one-out": {"title": "loo", "flags": ["--motion", "pdr-imu"], "track_flags": ["--oracle-start"],
+                                       "cold_flags": [], "chain_flags": ["--carry-k"], "gate": False}}}}
+        res = lab.run_suite(suite, "pr", work, [sys.executable, str(fake)])
+        ids = [r["id"] for r in res["results"]]
+        self.assertEqual(ids, ["private/site-x/leave-one-out/track", "private/site-x/leave-one-out/cold",
+                               "private/site-x/leave-one-out/track-k"])
+        calls = [json.loads(x) for x in log.read_text().splitlines()]
+        chain = [c for c in calls if "--carry-k" in c]
+        self.assertEqual([c[c.index("--test") + 1] for c in chain], ["build/b", "build/c", "build/a"])
+        ks = {c[c.index("--k-state") + 1] for c in chain}
+        self.assertEqual(len(ks), 1)                             # 三折共用一个 K 状态文件
+        self.assertTrue(all("--k-state" not in c for c in calls if "--carry-k" not in c))
+        self.assertTrue(all("--oracle-start" in c for c in chain))
+        self.assertEqual(lab.chronological(d, ["a", "b", "c", "zz"]), ["zz", "b", "c", "a"])   # 读不到 imu.csv 的排最前
+
+
 FAKE_EVAL = textwrap.dedent("""
     import json, sys
     a = sys.argv
