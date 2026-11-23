@@ -752,7 +752,7 @@ final class CarryMotionTests: XCTestCase {
             if loc.apply(ev) { pendingRespread = true }
         }
         let cal = StepScaleCalibrator()
-        if let c = calibrateEveryCm { cal.everyCm = c }
+        if let c = calibrateEveryCm { cal.everyCm = c; cal.learnFromPosterior = true }
         let ex = MagneticFeatureExtractor()
         var feature: MagneticFeature?
         var lastPos: Point2?
@@ -862,6 +862,94 @@ final class CarryMotionTests: XCTestCase {
             }
         }
         print("步长失配网格：" + lines.joined(separator: "；"))
+    }
+
+    /// 视觉里程计标定 K：步频和 K 不匹配（真实步长 1.3 m/s ÷ 步频）时，喂同一段的「ARKit」位置（真值转个任意角度、平移，
+    /// ARKit 坐标系和地图无关），K 朝真值方向走、走完 55 m 后推算的净位移比例比不标定时离 1 近得多
+    func testVisualOdometryCalibrationLearnsStride() {
+        for hz in [1.6, 2.2] {
+            var script = straightScript(durationS: 55 / 1.3, postures: [.init(fromS: 0, posture: .texting(tiltDeg: 40))])
+            script.stepHz = hz
+            let d = simulate(script)
+            // 不标定：推算净位移 / 真值净位移
+            let (plain, outs0) = runEngine(d, motionOn: true)
+            let ratio0 = outs0.last!.0.position.distance(to: outs0.first!.0.position)
+                / outs0.last!.1.position.distance(to: outs0.first!.1.position)
+            XCTAssertEqual(plain.activeCarryMode, .texting)
+            // 标定：每个惯导输出配上当时的「ARKit」位置
+            var cfg = FusionConfig()
+            cfg.useMagneticHeading = false
+            cfg.useCorridorConstraint = false
+            cfg.motion.enabled = true
+            let engine = FusionEngine(corridors: [], config: cfg)
+            engine.setInitialPosition(d.truth[0].position, headingRad: d.truth[0].headingRad)
+            var learned: [(CarryMode, Double)] = []
+            engine.onStepScaleLearned = { learned.append(($0, $1)) }
+            let cal = StepScaleCalibrator()
+            let rot = 1.1, off = Point2(-3000, 700)
+            for (smp, t) in zip(d.samples, d.truth) {
+                guard let o = engine.process(smp) else { continue }
+                let ar = Point2(t.position.x * cos(rot) - t.position.y * sin(rot) + off.x,
+                                t.position.x * sin(rot) + t.position.y * cos(rot) + off.y)
+                cal.observeVisualOdometry(tMs: o.tMs, ar: ar, trackingNormal: true, pdr: o.position, engine: engine)
+            }
+            let k = engine.learnedStepScales[.texting] ?? 1
+            print("视觉里程计标定 \(hz) Hz：不标定 推算/真值 \(String(format: "%.3f", ratio0))，标定 \(cal.vioUpdates) 次，"
+                  + "学到 \(String(format: "%.3f", k))（真值要 \(String(format: "%.3f", 1 / ratio0))），比值 \(cal.lastVIORatio ?? 0)")
+            XCTAssertGreaterThanOrEqual(cal.vioUpdates, 2, "\(hz) Hz：55 m 至少该更新两次")
+            XCTAssertEqual(learned.last?.0, .texting)
+            // 方向对，而且离真值比 1 近一大截（每 20 m 吸收一半：两次之后剩 1/4）
+            XCTAssertEqual(k > 1, ratio0 < 1, "\(hz) Hz：学到 \(k)，不标定的比例 \(ratio0)")
+            XCTAssertLessThan(abs(k - 1 / ratio0), 0.45 * abs(1 - 1 / ratio0) + 0.02, "\(hz) Hz")
+            XCTAssertEqual(engine.effectiveStepLengthK, CarryMotionTable.placeholder[.texting].stepLengthK * k, accuracy: 1e-9)
+        }
+    }
+
+    /// 视觉里程计标定的门限：ARKit 跟踪不正常、惯导投影进通道、窗口里净位移比例离谱（漏步 / 惯导没在推）、
+    /// 携带运动模型关着都不收；粒子后验默认不写进 K（`learnFromPosterior` 关）
+    func testVisualOdometryCalibrationGating() {
+        let d = simulate(straightScript(durationS: 6, postures: [.init(fromS: 0, posture: .texting(tiltDeg: 40))]))
+        let (engine, _) = runEngine(d, motionOn: true)
+        XCTAssertEqual(engine.activeCarryMode, .texting)
+        // ARKit 1 m/s、惯导 0.8 m/s，每 100 ms 一次：比值 1.25
+        func feed(_ cal: StepScaleCalibrator, seconds: Double, pdrSpeed: Double = 80, tracking: Bool = true) -> Int {
+            var n = 0
+            for i in 0..<Int(seconds * 10) {
+                let t = Int64(i * 100)
+                let s = Double(i) / 10
+                if cal.observeVisualOdometry(tMs: t, ar: Point2(100 * s, 0), trackingNormal: tracking,
+                                             pdr: Point2(0, pdrSpeed * s), engine: engine) != nil { n += 1 }
+            }
+            return n
+        }
+        // 跟踪不正常：不收
+        let c0 = StepScaleCalibrator()
+        XCTAssertEqual(feed(c0, seconds: 30, tracking: false), 0)
+        XCTAssertNil(engine.learnedStepScales[.texting])
+        // 正常：20 m 一批，比值 1.25，吸收一半 → 1.125
+        let c1 = StepScaleCalibrator()
+        XCTAssertEqual(feed(c1, seconds: 21), 1)
+        XCTAssertEqual(c1.lastVIORatio ?? 0, 1.25, accuracy: 0.02)
+        XCTAssertEqual(engine.learnedStepScales[.texting] ?? 0, 1.125, accuracy: 0.015)
+        // 惯导几乎不动（漏步 / 没在推）：窗口比值离谱，整窗不要
+        let c2 = StepScaleCalibrator()
+        XCTAssertEqual(feed(c2, seconds: 40, pdrSpeed: 10), 0)
+        XCTAssertEqual(engine.learnedStepScales[.texting] ?? 0, 1.125, accuracy: 0.015)
+        // 惯导投影进通道：不收
+        let c4 = StepScaleCalibrator()
+        engine.config.useCorridorConstraint = true
+        XCTAssertEqual(feed(c4, seconds: 30), 0)
+        engine.config.useCorridorConstraint = false
+        // 携带模型关着：不收
+        let (legacy, _) = runEngine(d, motionOn: false)
+        let c5 = StepScaleCalibrator()
+        for i in 0..<300 {
+            let s = Double(i) / 10
+            XCTAssertNil(c5.observeVisualOdometry(tMs: Int64(i * 100), ar: Point2(100 * s, 0), trackingNormal: true,
+                                                  pdr: Point2(80 * s, 0), engine: legacy))
+        }
+        // 粒子后验默认不写进 K
+        XCTAssertFalse(StepScaleCalibrator().learnFromPosterior)
     }
 
     /// 一开始就在口袋里、起点和朝向已知：第一次判出模式不重撒，直接按口袋参数跟踪
