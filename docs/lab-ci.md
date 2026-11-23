@@ -49,7 +49,7 @@
 
 | 协议 | 做法 |
 |---|---|
-| `leave-one-out` | **不用专门去走测试**：一张地图有 ≥ 3 次能用的建图会话时，每次拿掉一次，用其余的建图，再把拿掉那次的真实 IMU + 磁力计按 App 默认配置回放（`--motion pdr-imu --carry-motion --rooms --stationary-freeze`），参考轨迹 = 它自己的锚点 + ARKit。已知起点、冷启动各一个场景，带办公室指标；先不拦（`gate: false`）。后台排除名单（`/api/config/exclude`）和采集质量不合格的会话不用 |
+| `leave-one-out` | **不用专门去走测试**：一张地图有 ≥ 3 次能用的建图会话时，每次拿掉一次，用其余的建图，再把拿掉那次的真实 IMU + 磁力计按 App 默认配置回放（`--motion pdr-imu --carry-motion --rooms --stationary-freeze`），参考轨迹 = 它自己的锚点 + ARKit。已知起点、冷启动各一个场景，带办公室指标；先不拦（`gate: false`）。另有 `track-k`：已知起点，各折按会话开始时间排序依次跑，带着前面学到的步长 K（`--carry-k --k-state`，App 的 StepScaleStore 行为），每折回放完再用这次的 ARKit 位姿按视觉里程计标定学一遍 K（`--vio-k`：这次测绘时 App 会学到的），量「同一台手机测绘 / 开过摄像头之后」的跟踪。后台排除名单（`/api/config/exclude`）和采集质量不合格的会话不用 |
 | `walk-once` | **每个建图会话单独建图（= 只走一遍）**，用不是同一天的测试会话来测，所有组合混在一起出指标。这是对标 Oriient「走一遍就能用」的核心指标 |
 | `all-builds` | 全部建图会话融合后测 |
 | `track` | 全部建图会话融合，**已知起点跟踪**（`--oracle-start`）：量 App 实时定位的跟踪配置档（`MagneticConfig.tracking`）在自采门店上的表现。前两个协议都是冷启动 |

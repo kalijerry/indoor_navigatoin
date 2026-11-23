@@ -47,9 +47,15 @@ MagneticLocalizer.apply(_:)  按模式切特征权重 / 噪声下限 / 随机游
    只靠地磁的冷启动还没收敛时只重撒、**不进**保护期（保护期改似然温度，会让冷启动收敛门过度自信地错定）。
 5. **计步** `FusionStepDetector.adaptive`：阈值 = clamp(max(0.5 σ_dyn, 0.35 × 最近几步峰谷差), 1.0, 2.5)（σ 窗按名义 50 Hz 定长，
    不随毫秒时间戳抖动重建），步频锁只丢距上一步 < 0.6 步周期**且** < 0.45 s 的峰，停下 2 s 清步周期（慢走 / 停顿后不再只数一半）；
-   K 按模式表 × 在线学到的比例：`FusionEngine.applyLearnedStepScale(粒子步长比例中位数, for: 模式)`（吸收一半、限幅 0.6～1.7、可持久化），
-   调用方随后 `MagneticLocalizer.absorbStepScale` 把粒子比例除回去。`StepScaleCalibrator` 把这三步包好（收敛、没在保护期、粒子比例
-   σ ≤ 0.08 时每走 50 m 一次），App、评估器、流水线测试都用它。
+   K 按模式表 × 在线学到的比例：`FusionEngine.applyLearnedStepScale(比值, for: 模式)`（吸收一半、限幅 0.6～1.7、可持久化）。
+   `StepScaleCalibrator` 把标定包好，App、评估器、流水线测试都用它。**比值只取视觉里程计**（`observeVisualOdometry`：ARKit 跟踪正常时，
+   5 m 净位移、≤ 8 s 的窗口里 ARKit 净位移 / 惯导净位移，攒够 20 m 更新一次；比值离谱的窗口——漏步、惯导没在推——整窗不要）。
+   原来的「粒子步长比例后验中位数每 50 m 吸收一半」（`learnFromPosterior`）默认关：后验被墙的单边信息压短
+   （人走到通道尽头才转弯，走过头的粒子撞墙被罚、走得不够的不受罚；零漂移合成位姿上 −2.5%，真实计步 −4%，撞墙原地不动本身不偏，
+   偏差来自撞墙扣分），后验对真值的响应只有 ≈0.37，跨会话每次都在上次学到的 K 上再偏一截：公开 ILC 116 次按时间顺序回放
+   （`hpass-eval --carry-k`）看屏 K 1 → 0.64（真值约 0.91），误差中位 / P90 / 错定 2.4 m / 7.1 m / 20% → 3.1 m / 8.4 m / 28%；
+   自采 iPhone 商场学到的 K 带到办公室（同一台手机），办公室留一法 P90 233 → 247 cm。计步器距离也不当参照（室内正常步频比 ARKit 长约 11%，
+   慢走 0.2～0.9）。没开过摄像头的手机 K 就是模式表的值。
    **实测（合成）**：步频 1.6 / 1.8 / 2.2 Hz、速度 1.3 m/s（真实步长 0.81 / 0.72 / 0.59 m，K=0.45 给 ≈0.65 m）走 55 m 看屏，
    末端误差不标定 14.3 / 6.9 / 1.1 m，标定 14.3 / 6.9 / 1.0 m：跟踪档粒子步长比例的初始 σ 只有 0.06、随机游走 0.005/√m，
    20～25% 的步长失配粒子吸收不了，标定也就学不到（K 只动了 1%）。**每人步长差异是现在最大的误差来源之一**，
@@ -80,7 +86,8 @@ App（终端用户定位页，`MagneticEngine.makeFusion` / `makeLocalizer` / `w
 - `FusionEngine.live(..., carryMotion: 设置开关)`；有磁场图时惯导**不带通道约束**（只当增量用；冷启动的绝对位置 / 航向是随便给的）；
 - `IMUSample` 带 CoreMotion 的陀螺辅助重力（`gravity: -m.gravity × g`）；盲测模式打开近距离传感器，状态给 `fusion.proximityNear`；
 - 粒子滤波 `carryModeAdaptive`，`fusion.onCarryEvent = { loc.apply($0) }`，每换一个粒子滤波补 `loc.setCarryMode(fusion.activeCarryMode)`；
-- `StepScaleCalibrator` 每步调一次，学到的分模式比例存在本机（`StepScaleStore`），下次 `setLearnedStepScales` 恢复；
+- `StepScaleCalibrator.observeVisualOdometry` 在 ARKit 位姿回调里调（摄像头增强开着时），学到的分模式比例存在本机（`StepScaleStore`），
+  下次 `setLearnedStepScales` 恢复；`step`（粒子后验）照旧每步调，`learnFromPosterior` 关着时什么都不做；
 - track.csv 多 `carry_auto`（引擎判的携带方式）、`room_id` / `room_mass`（房间图地图）、`frozen`（静止冻结）列。
 
 评估（`SessionEvaluator` 的 `.pdrIMU`，`hpass-eval --motion pdr-imu --carry-motion`）同一套接法；已知起点时起步朝向在第一个参考点重设
