@@ -193,6 +193,8 @@ public enum SessionEvaluator {
         public var carryMode: CarryMode = .unknown
         /// 这一刻是静止冻结状态
         public var frozen = false
+        /// 纯推算位置（`.pdrIMU`：惯导引擎的输出，已知起点时从真值起点、起步朝向出发；诊断用）
+        public var odometry: Point2? = nil
     }
 
     /// `.pdrIMU` 回放用的惯导引擎：App 实时定位页同一份配置（`FusionEngine.live`，罗盘关），**不带通道约束**
@@ -315,12 +317,12 @@ public enum SessionEvaluator {
             if covered && est.converged { inMapErr.append(est.position.distance(to: r)) }
         }
         // 每个运动节拍（位姿 / 惯导输出）都写一行轨迹，滤波器这一拍没更新时用它最新的估计
-        func track(_ t: Int64) {
+        func track(_ t: Int64, odometry: Point2? = nil) {
             guard let cb = onTrack, let r = refAt(t) else { return }
             let e = sh.estimate
             cb(TrackPoint(tMs: t, estimate: e?.position, converged: e?.converged ?? false,
                           uncertaintyCm: e?.uncertaintyCm, reference: r, roomId: e?.roomId, roomMass: e?.roomMass ?? 0,
-                          carryMode: fusion?.carryMode ?? .unknown, frozen: sh.localizer.stationaryFrozen))
+                          carryMode: fusion?.carryMode ?? .unknown, frozen: sh.localizer.stationaryFrozen, odometry: odometry))
         }
         var lastFused: Point2?
         for (_, _, e) in evs {
@@ -341,7 +343,7 @@ public enum SessionEvaluator {
                         lastFused = out.position
                     }
                     if carryMotion { sh.localizer.setCarryMode(f.activeCarryMode, respread: false) }
-                    track(out.tMs)
+                    track(out.tMs, odometry: lastFused)
                     continue
                 }
                 let d = lastFused.map { out.position - $0 } ?? .zero
@@ -351,7 +353,7 @@ public enum SessionEvaluator {
                 }
                 if let est = sh.odometryStep(delta: d, tMs: out.tMs), let r = refAt(out.tMs) { score(est, r) }
                 if carryMotion { calibrator.step(deltaCm: d.length, engine: f, localizer: sh.localizer) }
-                track(out.tMs)
+                track(out.tMs, odometry: out.position)
             case .raw(let t, let v): sh.rawMag(tMs: t, v)
             case .ble(let b): sh.bleReading(tMs: b.tMs, id: b.id, rssi: b.rssi)
             case .wifi(let w): sh.wifiScan(w)

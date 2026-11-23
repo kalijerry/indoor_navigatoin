@@ -125,6 +125,9 @@ do {
     if motion == .pdrIMU { print("运动来源：真实 IMU 计步推算（FusionEngine）" + (CommandLine.arguments.contains("--oracle-start") ? "，起步朝向 \(startHeading.rawValue)" : "")) }
     // --track-out：每个运动节拍一行（会话、第几次、时刻、估计、是否有把握、不确定度、参考），给 tools/lab/office_metrics.py
     let trackOut = arg("--track-out")
+    // --odo-out：诊断用，--motion pdr-imu 时每个运动节拍一行纯推算位置（惯导引擎输出）+ 参考 + 滤波估计
+    let odoOut = arg("--odo-out")
+    var odoLines = ["session,run,t_ms,odo_x,odo_y,ref_x,ref_y,est_x,est_y,converged,unc_cm"]
     var trackLines = ["session,run,t_ms,est_x,est_y,converged,unc_cm,ref_x,ref_y,room_id,room_mass,carry_mode,frozen"]
     let carryMotion = CommandLine.arguments.contains("--carry-motion")
     let stationaryFreeze = CommandLine.arguments.contains("--stationary-freeze")
@@ -157,6 +160,16 @@ do {
                 if let v = arg("--lost-confidence-prior").flatMap(Double.init) { cfg.lostConfidenceWithExternalPrior = v }
                 if let v = arg("--confidence-scale").flatMap(Double.init) { cfg.confidenceScaleCm = v }
                 if let v = arg("--cluster-radius").flatMap(Double.init) { cfg.clusterRadiusCm = v }
+                // 运动模型的试验开关（默认不给 = 用配置档里的值）
+                if let v = arg("--init-scale-sigma").flatMap(Double.init) { cfg.initialScaleSigma = v }
+                if let v = arg("--scale-walk").flatMap(Double.init) { cfg.scaleWalkPerM = v }
+                if let v = arg("--heading-walk").flatMap(Double.init) { cfg.headingBiasWalkDegPerM = v }
+                if let v = arg("--init-heading-sigma").flatMap(Double.init) { cfg.initialHeadingBiasSigmaDeg = v }
+                if let v = arg("--pos-noise").flatMap(Double.init) { cfg.positionNoiseFraction = v }
+                if let v = arg("--conv-pos-noise").flatMap(Double.init) { cfg.convergedPositionNoiseFraction = v }
+                if let v = arg("--particles").flatMap(Int.init) { cfg.particleCount = v }
+                if let v = arg("--jump-confirm").flatMap(Int.init) { cfg.jumpConfirmUpdates = v }
+                if let v = arg("--blocked-penalty").flatMap(Double.init) { cfg.blockedPenalty = v }
                 if CommandLine.arguments.contains("--hard-ble-tracking") { cfg.bleSoftTracking = false }
                 if CommandLine.arguments.contains("--ble-soft-no-recover") { cfg.bleSoftLocalRecovery = false }
                 if let w = arg("--ble-soft-weight").flatMap(Double.init) { cfg.bleSoftPriorWeight = w }
@@ -178,8 +191,12 @@ do {
                                                   coldStartGate: CommandLine.arguments.contains("--cold-gate"),
                                                   wifi: useWiFi ? built.wifi : nil, motion: motion, startHeading: startHeading,
                                                   carryMotion: carryMotion, stationaryFreeze: stationaryFreeze,
-                                                  onTrack: trackOut == nil ? nil : { p in
+                                                  onTrack: trackOut == nil && odoOut == nil ? nil : { p in
                 func f1(_ v: Double?) -> String { v.map { String(format: "%.1f", $0) } ?? "" }
+                if odoOut != nil, let o = p.odometry {
+                    odoLines.append("\(t.lastPathComponent),\(k + 1),\(p.tMs),\(f1(o.x)),\(f1(o.y)),\(f1(p.reference.x)),\(f1(p.reference.y)),"
+                                    + "\(f1(p.estimate?.x)),\(f1(p.estimate?.y)),\(p.converged ? 1 : 0),\(f1(p.uncertaintyCm.flatMap { $0.isFinite ? $0 : nil }))")
+                }
                 trackLines.append("\(t.lastPathComponent),\(k + 1),\(p.tMs),\(f1(p.estimate?.x)),\(f1(p.estimate?.y)),"
                                   + "\(p.converged ? 1 : 0),\(f1(p.uncertaintyCm.flatMap { $0.isFinite ? $0 : nil })),\(f1(p.reference.x)),\(f1(p.reference.y)),"
                                   + "\(p.roomId ?? ""),\(p.roomId == nil ? "" : String(format: "%.3f", p.roomMass)),\(p.carryMode.rawValue),\(p.frozen ? 1 : 0)")
@@ -217,6 +234,10 @@ do {
     }
     let all = out.compactMap(\.medianCm)
     if all.count > 1 { print(String(format: "测试会话中位误差的中位：%.0f cm", all.sorted()[all.count / 2])) }
+    if let p = odoOut {
+        try (odoLines.joined(separator: "\n") + "\n").write(toFile: p, atomically: true, encoding: .utf8)
+        print("纯推算轨迹已写到 \(p)（\(odoLines.count - 1) 行）")
+    }
     if let p = trackOut {
         try (trackLines.joined(separator: "\n") + "\n").write(toFile: p, atomically: true, encoding: .utf8)
         print("逐点轨迹已写到 \(p)（\(trackLines.count - 1) 行）")

@@ -79,6 +79,11 @@ final class EvalMotionTests: XCTestCase {
         XCTAssertGreaterThan(track.count, 20)
         XCTAssertTrue(track.allSatisfy { abs($0.reference.x - 550) < 1 })
         XCTAssertTrue(track.contains { $0.converged && $0.estimate != nil })
+        // 诊断用的纯推算位置（hpass-eval --odo-out）：每行都有，从真值起点出发，合成会话里沿真值走
+        XCTAssertTrue(track.allSatisfy { $0.odometry != nil })
+        let o0 = try XCTUnwrap(track.first?.odometry), o1 = try XCTUnwrap(track.last?.odometry)
+        XCTAssertLessThan(o0.distance(to: track.first!.reference), 1)
+        XCTAssertLessThan(o1.distance(to: track.last!.reference), 150)
 
         // 老行为（位姿推粒子）：没有位姿就一步都不动、一个点都不出
         let old = try SessionEvaluator.evaluate(dir: t, map: map, field: built.field, ble: nil, walkable: walk, oracleStart: true)
