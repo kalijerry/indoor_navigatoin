@@ -70,7 +70,7 @@ RIDI / NILoc 的数字因许可证**全部作废**，下表没有任何一个数
 | `headingBiasWalkDegPerM` | 2 / 2 / 3 / 4 / 5 / 5 | 去 30 s 趋势后夹角的抖动 |
 | `stepHeadingSigmaDeg` | 3 / 3 / 10 / 6 / 8 / 10 | 步内航向残差 |
 | `featureWeights` / `observationSigmaFloorUT` | texting (0.5,1,0.25)/4（现有跟踪档）… swinging (1,0.3,0.1)/6 | `hpass-eval --residuals` + `tools/bench/mag_residuals.py` 按模式出 t 尺度 / 相关长度；口袋高度（0.8 m）和建图高度的梯度差先做「手持 + 髋部两机同走」的残差实验 |
-| `StepDetectorTuning` | 0.5 σ / 0.35 × 峰谷差 / 1.0～2.5 / 0.6 周期 | 各模式 steps_ratio 0.97～1.03（含快走） |
+| `StepDetectorTuning` | 0.5 σ / 0.35 × 峰谷差 / 0.7～2.5 / 0.6 周期（下限 0.7 已按自采 iPhone 标过：看屏走路步峰 P2 ≈ 0.80，手拿着站着的抖动峰 P90 ≈ 0.64；办公室慢走「走着没计到步」的时段 19.5% → 2.3%） | 各模式 steps_ratio 0.97～1.03（含快走）；口袋 / 包的 iPhone 步峰分布出来后复核下限 |
 | `lostSuppressCm` | 800 / 1500 | 切换后重新收紧航向要走的路（合成走廊里 5～10 m） |
 | `CarryMotionConfig.handledSpreadDeg` | nil（整圆） | 看「换手 / 拿起来看」这类小动作的 δ 变化；若多数 < 45° 可改成 45 |
 

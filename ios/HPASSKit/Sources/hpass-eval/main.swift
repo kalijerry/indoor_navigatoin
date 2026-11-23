@@ -12,6 +12,7 @@ import HPASSKit
 //   --track-out track.csv         每个运动节拍一行估计 + 参考（tools/lab/office_metrics.py 用）
 //   --carry-motion                pdr-imu 时打开携带无关的运动模型 + 粒子按携带模式重撒 + 步长 K 在线标定（App 同一套接法）
 //   --stationary-freeze           pdr-imu 时打开静止冻结（惯导说没在动就算静止；办公室坐着不动用，配合 --rooms）
+//   --dr-dump dr.csv              诊断：只对 --test 跑纯计步推算（起点 / 朝向取参考轨迹），逐拍写 CSV，给 tools/bench/dr_decompose.py 拆误差
 
 func arg(_ name: String) -> String? {
     guard let i = CommandLine.arguments.firstIndex(of: name), i + 1 < CommandLine.arguments.count else { return nil }
@@ -34,6 +35,17 @@ guard let mapPath = arg("--map") else {
 }
 do {
     let map = try StoreDataLoader.loadMap(Data(contentsOf: URL(fileURLWithPath: mapPath)))
+    // 诊断：--test 的每个会话只跑纯计步推算（不建图、不定位），逐拍和参考轨迹一起写成 CSV（tools/bench/dr_decompose.py 拆误差）
+    if let dp = arg("--dr-dump") {
+        var lines = [DeadReckoningDump.csvHeader]
+        for t in list(arg("--test")) {
+            let rows = try DeadReckoningDump.run(dir: t, map: map, carryMotion: CommandLine.arguments.contains("--carry-motion"))
+            lines += DeadReckoningDump.csvLines(session: t.lastPathComponent, rows: rows)
+        }
+        try (lines.joined(separator: "\n") + "\n").write(toFile: dp, atomically: true, encoding: .utf8)
+        print("纯推算已写到 \(dp)")
+        exit(0)
+    }
     let build = list(arg("--build")), test = list(arg("--test"))
     guard !build.isEmpty, !test.isEmpty else { print("--build 和 --test 都要给"); exit(2) }
     let overlap = Set(build.map(\.standardizedFileURL)).intersection(test.map(\.standardizedFileURL))

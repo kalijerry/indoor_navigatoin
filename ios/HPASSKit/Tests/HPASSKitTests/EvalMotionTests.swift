@@ -85,6 +85,30 @@ final class EvalMotionTests: XCTestCase {
         XCTAssertEqual(old.points, 0)
     }
 
+    /// 诊断导出（hpass-eval --dr-dump）：纯推算从参考起点、真值朝向出发，参考开始之前的预滚不算；CSV 列数和表头一致
+    func testDeadReckoningDumpFollowsStraightWalk() throws {
+        let map = try bigMap()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("evalmotion_\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let t = root.appendingPathComponent("test1")
+        try writeIMUSession(t, from: Point2(550, 150), preroll: 3)
+        for carry in [false, true] {
+            let rows = try DeadReckoningDump.run(dir: t, map: map, carryMotion: carry)
+            XCTAssertGreaterThan(rows.count, 20)
+            XCTAssertTrue(rows.allSatisfy { $0.reference != nil })
+            XCTAssertEqual(rows.first!.position.y, 150, accuracy: 120, "预滚不该把起点推走")
+            let last = rows.last!
+            // 约 11 s × 1.12 m/s ≈ 12.3 m 朝 +y：步长模型有误差，但方向、量级要对
+            XCTAssertEqual(last.position.x, 550, accuracy: 100)
+            XCTAssertEqual(last.position.y - 150, last.reference!.y - 150, accuracy: 0.35 * (last.reference!.y - 150), "carry=\(carry)")
+            XCTAssertGreaterThan(last.stepCount - rows.first!.stepCount, 15)
+            XCTAssertGreaterThan(last.stepK, 0.3)
+            let lines = DeadReckoningDump.csvLines(session: "s", rows: rows)
+            let cols = DeadReckoningDump.csvHeader.split(separator: ",", omittingEmptySubsequences: false).count
+            XCTAssertTrue(lines.allSatisfy { $0.split(separator: ",", omittingEmptySubsequences: false).count == cols })
+        }
+    }
+
     func testMotionBeforeReferenceStartIsIgnored() throws {
         let map = try bigMap()
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("evalmotion_\(UUID().uuidString)")
