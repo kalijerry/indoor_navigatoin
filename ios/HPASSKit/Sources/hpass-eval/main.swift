@@ -171,6 +171,11 @@ do {
                 // 只靠地磁的冷启动不报位置（产品决定，见 MagneticConfig.magOnlyColdStartReports）
                 if CommandLine.arguments.contains("--no-mag-only-cold-fix") { cfg.magOnlyColdStartReports = false }
                 if let v = arg("--uniform-inject").flatMap(Int.init) { cfg.uniformHeadingForInjection = v != 0 }
+                // 冷启动搜索的试验开关（默认按地图面积取，见 SmallMapColdStart）：粒子数、挑战者开关 / 门限 / 粒子数
+                if let v = arg("--cold-particles").flatMap(Int.init) { cfg.coldStartParticleCount = v }
+                if let v = arg("--challenger").flatMap(Int.init) { cfg.coldChallenger = v != 0 }
+                if let v = arg("--challenger-bf").flatMap(Double.init) { cfg.coldChallengerLogBayesFactor = v }
+                if let v = arg("--challenger-particles").flatMap(Int.init) { cfg.coldChallengerParticleCount = v }
             }, seed: UInt64(k + 1), refTagPositions: refTags,
                                                   oracleStart: CommandLine.arguments.contains("--oracle-start"),
                                                   odometry: odometry,
