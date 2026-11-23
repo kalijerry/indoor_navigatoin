@@ -159,6 +159,7 @@ public extension MagneticConfig {
     /// 例外：小场地（地图外框面积 ≤ `magOnlyColdStartMaxAreaM2`，办公室 / 房间）只靠地磁也报位置。
     /// 办公室没有蓝牙标签、也没有货架标识牌，按上面的规则就永远定不到；商场的错定来自几千平米里
     /// 十几米的磁场序列能对上很多处，几百平米的房间里长得像的地方少得多。收敛门、远跳确认照旧。
+    /// 小场地报只靠地磁的定位，所以搜索也加强（见 `SmallMapColdStart`）：粒子更多，定到之后后台挑战者接着搜（`coldChallenger`）。
     /// - Parameters:
     ///   - visualOdometry: 视觉里程计在推粒子（ARKit 可用且打开了）。
     ///   - mapAreaM2: 地图外框面积（m²）；nil = 不知道，按大场地处理（不报）。
@@ -178,6 +179,11 @@ public extension MagneticConfig {
         // 每次读数的整体水平会差 10～16 µT（磁力计偏置估计不同）：没定到按起伏找，定到后估出偏移再按绝对值比
         c.hybridOffset = true
         c.magOnlyColdStartReports = magOnlyColdStartAllowed(mapAreaM2: mapAreaM2)
+        if magOnlyColdStartAllowed(mapAreaM2: mapAreaM2) {
+            c.coldStartParticleCount = SmallMapColdStart.particleCount
+            c.coldChallenger = true
+            c.coldChallengerParticleCount = SmallMapColdStart.challengerParticleCount
+        }
         return c
     }
 
@@ -189,6 +195,25 @@ public extension MagneticConfig {
         guard let a = mapAreaM2, a > 0 else { return false }
         return a <= magOnlyColdStartMaxAreaM2
     }
+}
+
+/// 小场地（`MagneticConfig.magOnlyColdStartAllowed`：办公室 / 房间）只靠地磁冷启动的搜索设置。
+///
+/// 冷启动不知道位置、航向，也不知道这次计步的步长比例，粒子要盖住 位置 × 航向 × 步长比例 四维。
+/// 实测计步的距离比例离 1 很远、而且每次不一样（公开 ILC 真实 IMU 手持：计步距离 / 真值 1.05～1.29；
+/// 自采办公室 iPhone 建图会话 0.36～0.92），按 1 ± 6% 撒的 6000 个粒子在几百平米里经常没有一个落在对的假设附近，
+/// 于是锁到长得像的地方；粒子权重是相对的，整团锁错之后自己判不了丢。
+/// - 粒子数：合成办公室（public/sim-office-phone，步长偏短 0.82）冷启动错定 6000 → 12000 → 24000 → 48000 个粒子
+///   65% → 52% → 42% → 37%（拐点在 24000；48000 再翻倍只多 5 个点）。只在找位置时用，定到之后照旧缩到 `particleCount`；
+/// - 挑战者（`MagneticConfig.coldChallenger`）：定到之后后台用常规冷启动的粒子数从零接着搜，另一个假设在同一段新观测上
+///   证据压过主滤波器（对数贝叶斯因子 ≥ ln 100）就换过去：合成办公室错定再 42% → 30%（ln 20 / ln 100 / ln 1000：
+///   26% / 30% / 28%，比较窗口 10 m / 20 m 一样）。
+/// 大场地不用：只靠地磁不报位置（商场上 24000 个粒子也还是 90% 错定），蓝牙 / Wi-Fi 先验在缩小范围。
+public enum SmallMapColdStart {
+    /// 冷启动（找位置时）的粒子数
+    public static let particleCount = 24000
+    /// 挑战者搜索时的粒子数（常规冷启动的数目：挑战者一直在后台跑，算力按常规冷启动给）
+    public static let challengerParticleCount = MagneticConfig().coldStartParticleCount
 }
 
 /// Wi-Fi 冷启动（只有 Android 能扫 Wi-Fi；评估 `--wifi`，场景 public/pdr/cold-wifi）：

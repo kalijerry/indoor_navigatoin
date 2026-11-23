@@ -54,13 +54,15 @@ public final class ShadowLocalizer {
     ///   （蓝牙粗定位 / 标签范围）时起作用，走够路、峰够突出才宣布定到，宁可不报也不报错的。默认关（原有行为）。
     /// - Parameter visualOdometry: 冷启动配置档按哪种运动来源取（`MagneticConfig.liveColdStart`）。默认 true（ARKit 位姿，原有行为）；
     ///   评估器的 `.pdrIMU`（真实计步推算）传 false，和 App 不开视觉里程计时的冷启动一致。
+    /// - Parameter mapAreaM2: 地图外框面积（m²），和 App 实时定位页一样传给 `liveColdStart`：小场地的冷启动搜索更强
+    ///   （`SmallMapColdStart`）。nil = 不知道（原有行为；采集时的影子定位不传）。评估器传地图的外框面积。
     public init(field: MagneticFieldMap, walkable: WalkableMap?, useRawMag: Bool,
                 configure: ((inout MagneticConfig) -> Void)? = nil, seed: UInt64 = 1, coldStartGate: Bool = false,
-                visualOdometry: Bool = true) {
+                visualOdometry: Bool = true, mapAreaM2: Double? = nil) {
         // 和实时定位页的冷启动同一份配置档（hybridOffset 实测同会话 P90 258→131 cm、首次定位 7→4 m，见 docs/roadmap.md），
         // 只有一处不同：采集时的影子定位 / 自动起点、评估默认照旧在只靠地磁时也报位置；
         // App 的行为（只靠地磁不报）用 hpass-eval --no-mag-only-cold-fix（Lab 的冷启动场景都这样跑）
-        var cfg = MagneticConfig.liveColdStart(visualOdometry: visualOdometry)
+        var cfg = MagneticConfig.liveColdStart(visualOdometry: visualOdometry, mapAreaM2: mapAreaM2)
         cfg.magOnlyColdStartReports = true
         if coldStartGate {
             cfg.applyColdStartGate()

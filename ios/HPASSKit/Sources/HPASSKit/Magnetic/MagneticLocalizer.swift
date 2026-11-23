@@ -194,6 +194,26 @@ public struct MagneticConfig {
     /// 公开商场楼层上量过：只靠地磁冷启动，各种收敛门（走够路、峰够突出、连续更多次、有效粒子）组合下错定都还有 91～100%，
     /// 十几米的磁场序列在八千多平米的楼层里能对上很多处。hpass-eval `--no-mag-only-cold-fix`。
     public var magOnlyColdStartReports = true
+    // MARK: 冷启动挑战者（默认关；小场地的 `liveColdStart` 打开）
+    //
+    // 只靠地磁冷启动定到之后，后台再跑一个从零开始的冷启动搜索（挑战者）。粒子滤波的权重是相对的：
+    // 整团粒子都锁在错的地方时，归一化之后它照样「很有把握」，自己判不了丢；随机注入的零星新粒子在
+    // 位置 × 航向 × 步长比例里几乎碰不到对的假设。挑战者也定到了、而且离主滤波器的位置远（两个不同的假设）时，
+    // 两边在接下来同一段观测上比证据（每次观测更新的 log Σ w·L，同一套似然），对数贝叶斯因子超过门限就换成挑战者的粒子；
+    // 主滤波器先到门限、或比满一个窗口都没分出胜负，就留主滤波器（维持现状），挑战者从零重新搜。
+    // 挑战者定到的位置离主滤波器很近 = 印证，也从零重新搜。用过外部位置先验（蓝牙 / 区域观测）或已知起点时不跑。
+
+    /// 打开冷启动挑战者
+    public var coldChallenger = false
+    /// 一轮比证据最多比多少次观测更新（每次约 `updateDistanceCm`）
+    public var coldChallengerWindowUpdates = 20
+    /// 对数贝叶斯因子门限（任何一方领先这么多就判胜负）
+    public var coldChallengerLogBayesFactor: Double = log(100)
+    /// 挑战者定到的位置离主滤波器超过这么远（cm）才算另一个假设
+    public var coldChallengerSeparationCm: Double = 500
+    /// 挑战者搜索时的粒子数（nil = 同 `coldStartParticleCount`）
+    public var coldChallengerParticleCount: Int?
+
     /// 跟踪配置档的运动来源（nil = 不是跟踪档）。运动来源中途变了（视觉里程计没对齐 / 跟丢时计步顶上）
     /// 用 `MagneticLocalizer.setOdometry` 换成对应那一套参数。
     public var trackingOdometry: OdometrySource?
@@ -445,6 +465,7 @@ public final class MagneticLocalizer {
     @discardableResult
     public func setCarryMode(_ mode: CarryMode, respread: Bool = true) -> Bool {
         guard config.carryModeAdaptive, mode.isCarryPosture else { return false }
+        challenger?.setCarryMode(mode, respread: respread)
         let prev = carryMode
         carryMode = mode
         guard config.applyCarryMode(mode) else { return false }
@@ -460,6 +481,7 @@ public final class MagneticLocalizer {
     @discardableResult
     public func apply(_ ev: CarryMotionEvent) -> Bool {
         guard config.carryModeAdaptive, config.trackingOdometry != .vio else { return false }
+        challenger.map { _ = $0.apply(ev) }
         switch ev.kind {
         case .initial:
             return setCarryMode(ev.to, respread: false)
@@ -498,6 +520,7 @@ public final class MagneticLocalizer {
     /// 步长 K 吸收了 `factor` 之后，把每个粒子的步长比例除以同一个 factor：净位移不变，比例回到 1 附近。
     public func absorbStepScale(_ factor: Double) {
         guard factor.isFinite, factor > 0.3, factor < 3 else { return }
+        challenger?.absorbStepScale(factor)
         for i in scale.indices {
             scale[i] = min(max(scale[i] / factor, config.scaleRange.lowerBound), config.scaleRange.upperBound)
         }
@@ -509,6 +532,7 @@ public final class MagneticLocalizer {
         self.walkable = walkable
         self.config = config
         self.rng = MagRNG(seed: seed)
+        challengerSeed = seed &* 0xD1B5_4A32_D192_ED03 &+ 1
         for j in 0..<field.rows {
             for i in 0..<field.cols {
                 let c = Point2((Double(i) + 0.5) * field.cellCm, (Double(j) + 0.5) * field.cellCm)
@@ -612,6 +636,9 @@ public final class MagneticLocalizer {
         searchPathCm = 0
         carryMode = .unknown
         lostSuppressRemainingCm = 0
+        challenger = nil
+        duelLogRatio = 0
+        duelUpdates = 0
     }
 
     /// 是否已经收敛（有把握）
@@ -824,6 +851,7 @@ public final class MagneticLocalizer {
             if frozenBuffer.count > 600 { frozenBuffer.removeFirst(frozenBuffer.count - 600) }
         }
         let dist = stationaryFrozen ? 0 : delta.length
+        let updatesBefore = updateCount
         if let l = lateral {
             if let v = l.leftCm { latLeftSum += v; latLeftN += 1 }
             if let v = l.rightCm { latRightSum += v; latRightN += 1 }
@@ -877,6 +905,9 @@ public final class MagneticLocalizer {
             trustSum = 0
         }
         if due { clearLateral() }
+        if config.coldChallenger || challenger != nil {
+            runChallenger(delta: stationaryFrozen ? .zero : delta, feature: feature, trust: trust, mainUpdated: updateCount != updatesBefore)
+        }
         return estimate()
     }
 
@@ -1085,7 +1116,7 @@ public final class MagneticLocalizer {
                 logw[i] += missing
             }
         }
-        normalize()
+        lastLogEvidence = normalize()
         // 混合模式：定到之后慢慢跟踪偏移（读数 − 地图在当前位置的值）
         if config.hybridOffset, config.offsetWarmupUpdates > 0 {
             updateRobustOffset(f)
@@ -1248,6 +1279,94 @@ public final class MagneticLocalizer {
     /// 累计丢失过几次。
     public private(set) var lostCount = 0
 
+    // MARK: 冷启动挑战者（见 `MagneticConfig.coldChallenger`）
+
+    /// 后台的冷启动搜索（只在打开了 coldChallenger、只靠地磁冷启动定到之后才有）
+    private var challenger: MagneticLocalizer?
+    private var duelLogRatio = 0.0
+    private var duelUpdates = 0
+    /// 挑战者的随机种子（不动主滤波器自己的随机数序列：没换过时和不开挑战者的结果一样）
+    private var challengerSeed: UInt64 = 0
+    /// 换成挑战者的次数 / 比过证据的轮数（诊断、测试）
+    public private(set) var challengerSwaps = 0
+    public private(set) var challengerDuels = 0
+    /// 挑战者正在后台搜
+    public var challengerActive: Bool { challenger != nil }
+    /// 最近一次观测更新的对数证据 log Σ w·L（含上次归一化之后运动约束的扣分），比证据用
+    public private(set) var lastLogEvidence = 0.0
+
+    /// 挑战者该不该跑：冷启动、已定到、没用过外部位置先验
+    private var challengerEligible: Bool {
+        config.coldChallenger && coldStart && !startedFromPrior && hasConverged && !externalPriorApplied
+    }
+
+    /// 从零开始一轮后台搜索。观测更新的节拍对齐主滤波器（走过的路、攒的特征照抄），两边在同一时刻、同一段读数上更新
+    private func spawnChallenger() {
+        var c = config
+        c.coldChallenger = false
+        if let n = config.coldChallengerParticleCount { c.coldStartParticleCount = n }
+        challengerSeed &+= 0x9E37_79B9_7F4A_7C15
+        let ch = challenger ?? MagneticLocalizer(field: field, walkable: walkable, config: c, seed: challengerSeed)
+        ch.config = c
+        ch.reset(start: nil, headingUnknown: true)
+        ch.carryMode = carryMode
+        ch.travelledCm = travelledCm
+        ch.featureSum = featureSum
+        ch.featureCount = featureCount
+        ch.trustSum = trustSum
+        ch.firstUpdateDone = true
+        challenger = ch
+        duelLogRatio = 0
+        duelUpdates = 0
+    }
+
+    /// 主滤波器这一步之后：挑战者走同一步；定到了就在同一段观测上和主滤波器比证据
+    private func runChallenger(delta: Point2, feature: MagneticFeature?, trust: Double, mainUpdated: Bool) {
+        guard challengerEligible else {
+            challenger = nil
+            duelLogRatio = 0
+            duelUpdates = 0
+            return
+        }
+        guard let ch = challenger else { spawnChallenger(); return }
+        let cu = ch.updateCount
+        ch.step(delta: delta, feature: feature, trust: trust)
+        guard ch.hasConverged else { duelLogRatio = 0; duelUpdates = 0; return }
+        if ch.estimate().position.distance(to: estimate().position) <= config.coldChallengerSeparationCm {
+            spawnChallenger()           // 印证了主滤波器：重新从零搜
+            return
+        }
+        guard mainUpdated, ch.updateCount != cu else { return }
+        if duelUpdates == 0 { challengerDuels += 1 }
+        duelLogRatio += ch.lastLogEvidence - lastLogEvidence
+        duelUpdates += 1
+        if duelLogRatio >= config.coldChallengerLogBayesFactor && !stationaryFrozen {
+            adopt(ch)
+            challengerSwaps += 1
+            spawnChallenger()
+        } else if duelLogRatio <= -config.coldChallengerLogBayesFactor || duelUpdates >= config.coldChallengerWindowUpdates {
+            spawnChallenger()
+        }
+    }
+
+    /// 换成挑战者的粒子和匹配状态（仍是「冷启动后已定到」；携带模式、静止冻结、找回这些主滤波器自己的状态不动）
+    private func adopt(_ o: MagneticLocalizer) {
+        xs = o.xs; ys = o.ys; bias = o.bias; scale = o.scale; logw = o.logw
+        ema0 = o.ema0; ema1 = o.ema1; ema2 = o.ema2
+        obsEma = o.obsEma
+        offsetEst = o.offsetEst
+        offsetResiduals = o.offsetResiduals
+        committed = o.committed
+        lastCenter = o.lastCenter
+        motionSinceUpdate = o.motionSinceUpdate
+        meanMotion = o.meanMotion
+        lastEffectiveRatio = o.lastEffectiveRatio
+        recentTotals = o.recentTotals
+        switchStreak = 0
+        holdingAgainstFar = false
+        lowStreak = 0
+    }
+
     /// 减去最大值再归一到 Σw = 1（对数域），防止下溢。
     /// 按场景算地磁权重（每 5 次观测更新一次）。找位置时用下面四项相乘，已经定到时基本全给（见函数末尾）：
     /// - 磁场图密度：粒子加权中心 4 m 内有数据的格子比例（< 20% 几乎不用地磁，≥ 70% 全用）；
@@ -1293,15 +1412,18 @@ public final class MagneticLocalizer {
         }
     }
 
-    private func normalize() {
+    /// 返回归一化前的 log Σ w（上次归一化之后各项似然 / 扣分的对数证据）；权重全是 −∞ 时返回 −∞
+    @discardableResult
+    private func normalize() -> Double {
         guard let mx = logw.max(), mx.isFinite else {
             logw = [Double](repeating: 0, count: logw.count)
-            return
+            return -.infinity
         }
         var sum = 0.0
         for v in logw { sum += exp(v - mx) }
         let shift = mx + log(sum)
         for i in 0..<logw.count { logw[i] -= shift }
+        return shift
     }
 
     private func effectiveCount() -> Double {

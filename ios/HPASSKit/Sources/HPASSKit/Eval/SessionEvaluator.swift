@@ -237,8 +237,11 @@ public enum SessionEvaluator {
             return t - ref[lo].tMs > 300 ? nil : ref[lo].p  // 参考点比查询时刻旧 300 ms 以上就不算
         }
         let pdr = motion == .pdrIMU
+        // 冷启动配置档按地图外框面积取（和 App 实时定位页一样：小场地的搜索更强，见 SmallMapColdStart）；
+        // 已知起点下面马上换成跟踪档，不传（不多撒一遍冷启动粒子，随机数序列和原来一样）
         let sh = ShadowLocalizer(field: field, walkable: walkable, useRawMag: !s.raw.isEmpty, configure: configure, seed: seed,
-                                coldStartGate: coldStartGate, visualOdometry: !pdr)
+                                coldStartGate: coldStartGate, visualOdometry: !pdr,
+                                mapAreaM2: oracleStart ? nil : map.width * map.height / 10_000)
         sh.bleMap = ble
         sh.crossCheckEnabled = crossCheck
         // 真实计步：惯导引擎和 App 实时定位页同一份配置（FusionEngine.live，罗盘关）。
