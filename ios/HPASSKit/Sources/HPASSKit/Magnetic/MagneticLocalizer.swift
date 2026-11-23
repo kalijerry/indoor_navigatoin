@@ -762,6 +762,23 @@ public final class MagneticLocalizer {
         return (m, (v / sw).squareRoot(), (-2 * log(r)).squareRoot() * 180 / Double.pi)
     }
 
+    /// 航向偏差的加权直方图（整圆分 `bins` 格，第 k 格 = [−180° + k·360°/bins, …)，和为 1）。诊断用（hpass-eval --diag-out）
+    public func headingBiasHistogram(bins: Int = 12) -> [Double] {
+        let nb = max(bins, 1)
+        var h = [Double](repeating: 0, count: nb)
+        guard !xs.isEmpty else { return h }
+        let mx = logw.max() ?? 0
+        var tot = 0.0
+        for i in xs.indices {
+            let w = exp(logw[i] - mx)
+            var a = bias[i].truncatingRemainder(dividingBy: 2 * Double.pi)
+            if a < -Double.pi { a += 2 * Double.pi } else if a >= Double.pi { a -= 2 * Double.pi }
+            h[min(Int((a + Double.pi) / (2 * Double.pi) * Double(nb)), nb - 1)] += w
+            tot += w
+        }
+        return tot > 0 ? h.map { $0 / tot } : h
+    }
+
     /// 标签范围约束：每片听到的标签都要求「人在它 rangeCm 以内」（按信号强弱定，实测 P90：−75 dBm 2.5 m、
     /// −80 3.2 m、−85 5 m、−90 8 m）。磁场平缓的地方几处长得像，粒子会被拉到别处；附近没有这片标签的位置直接被压下去。
     /// 每片标签的惩罚有上限 capLog（标签表个别位置不对、反射，不至于一片就把正确的位置否掉）。
