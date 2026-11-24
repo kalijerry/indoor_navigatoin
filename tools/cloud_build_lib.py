@@ -67,6 +67,14 @@ def build_unchanged(prev, names, live_names, wm_session, geometry_version):
     return prev.get("mapGeometryVersion") == geometry_version
 
 
+def edits_hash(edits):
+    """看板手动分段修改的指纹（内容一样 → 一样；没有修改 → None，和旧报告没记这个键时一致）"""
+    if not edits:
+        return None
+    import hashlib
+    return hashlib.sha1(json.dumps(edits, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+
+
 def _to_map(t, x, y):
     phi, px, py, ax, ay = t
     dx, dy = x - ax, y - ay

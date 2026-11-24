@@ -1,0 +1,594 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>建图路线</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #6b7280; --line: #e3e6eb;
+    --accent: #2563eb; --shelf: #9aa3af; --cross: rgba(37, 99, 235, .14); --floor: rgba(37, 99, 235, .06); --wall: #374151;
+    --gray: #9ca3af; --green: #16a34a; --yellow: #d4a106; --red: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1218; --panel: #171b23; --text: #e6e9ef; --muted: #9aa3b2; --line: #2a303b;
+      --accent: #60a5fa; --shelf: #5b6472; --cross: rgba(96, 165, 250, .16); --floor: rgba(96, 165, 250, .07); --wall: #cbd2dc;
+      --gray: #6b7280; --green: #22c55e; --yellow: #eab308; --red: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 -apple-system, "PingFang SC", "Helvetica Neue", sans-serif; background: var(--bg); color: var(--text); }
+  header { display: flex; gap: 8px; align-items: center; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0 6px 0 0; }
+  main { display: grid; grid-template-columns: 1fr 340px; gap: 12px; padding: 12px 16px; height: calc(100vh - 52px); }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; height: auto; } #mapWrap { height: 62vh; } #hint { display: none; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px; overflow: auto; min-height: 0; }
+  .panel h2 { font-size: 13px; margin: 10px 0 6px; color: var(--muted); font-weight: 600; }
+  .panel h2:first-child { margin-top: 2px; }
+  #mapWrap { position: relative; padding: 0; overflow: hidden; }
+  canvas { width: 100%; height: 100%; display: block; touch-action: none; }
+  #hint { position: absolute; left: 10px; bottom: 8px; right: 10px; font-size: 12px; color: var(--muted); pointer-events: none; }
+  #zoom { position: absolute; right: 8px; top: 8px; display: flex; flex-direction: column; gap: 4px; }
+  input, select, button { font: inherit; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+  button { cursor: pointer; min-height: 32px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+  .kv { color: var(--muted); font-size: 12px; }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin: 4px 0; }
+  .legend span { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; font-size: 12px; }
+  .chip { width: 12px; height: 12px; border-radius: 3px; display: inline-block; flex: none; }
+  .sess { border-bottom: 1px solid var(--line); padding: 6px 0; }
+  .sess .name { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+  .segs { display: flex; gap: 3px; flex-wrap: wrap; margin-top: 4px; }
+  .segs button { min-height: 22px; padding: 0 6px; font-size: 11px; border-width: 2px; }
+  .segs button.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .segs button.del { text-decoration: line-through; opacity: .5; }
+  .nudge { display: grid; grid-template-columns: repeat(3, 40px); gap: 4px; }
+  .nudge button { padding: 0; }
+  #msg { font-size: 12px; }
+  .bad { color: var(--red); }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>建图路线</h1>
+  <select id="mapSel"><option value="">选地图…</option></select>
+  <input id="token" type="password" placeholder="口令" style="width:140px">
+  <button id="load">载入</button>
+  <button id="undo" disabled>撤销</button>
+  <button id="save" disabled>保存</button>
+  <button id="saveBuild" class="primary" disabled>保存并重建地图</button>
+  <span id="msg" class="kv"></span>
+  <a href="/" class="kv" style="margin-left:auto">← 看板</a>
+</header>
+<main>
+  <section class="panel" id="mapWrap">
+    <canvas id="cv"></canvas>
+    <div id="zoom"><button id="zin">＋</button><button id="zout">－</button><button id="zfit">全图</button></div>
+    <div id="hint">点一段选中；拖它挪位置、拖末端圆点旋转；空白处拖动平移，滚轮 / 双指缩放。键盘：方向键挪 10 cm（Shift 50 cm），Q / E 转 0.5°，Delete 删除 / 恢复，Ctrl+Z 撤销。</div>
+  </section>
+  <section class="panel">
+    <h2>颜色（按重叠处磁场对不对得上）</h2>
+    <div class="legend" id="legend"></div>
+    <details><summary>为什么会变色</summary>
+      <div class="kv" style="margin-top:4px">磁场是位置的函数，同一处走两遍读数应该一样。只有一条路线时没东西可比，是<b>灰</b>；第二条路线走过同一处就能比：对得上两条都<b>绿</b>，对不上说明至少一条画错了位置，两条都变<b>黄 / 红</b>；再走第三条，和多数一致的回到绿，错的那条留红。红的段挪到对的位置会变回绿，挪不回来就删掉。自动建图也会丢掉对不上的部分。</div>
+    </details>
+    <div class="row"><label class="kv"><input type="checkbox" id="whole"> 整遍一起挪</label>
+      <label class="kv" title="拖完松手后，机器在附近 ±50 cm、±3° 里找磁场最吻合的位置吸附过去"><input type="checkbox" id="snap"> 松手自动吸附（试验）</label>
+      <label class="kv"><input type="checkbox" id="showDel" checked> 显示删掉的段</label>
+      <label class="kv"><input type="checkbox" id="showMap" checked> 显示地图</label></div>
+    <h2>选中的段</h2>
+    <div id="selInfo" class="kv">还没选。点地图上的一段路线。</div>
+    <div id="selTools" hidden>
+      <div class="row" style="align-items:flex-start; gap:12px">
+        <div class="nudge">
+          <button data-n="rl" title="逆时针 0.5°">⟲</button><button data-n="u">↑</button><button data-n="rr" title="顺时针 0.5°">⟳</button>
+          <button data-n="l">←</button><button data-n="d">↓</button><button data-n="r">→</button>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:4px">
+          <button id="sug" hidden></button>
+          <button id="del">删除这段</button>
+          <button id="reset" title="回到不手动摆时自动对齐的位置">复位到自动对齐</button>
+        </div>
+      </div>
+    </div>
+    <h2>各遍采集</h2>
+    <div id="sessions" class="kv">载入地图后显示。</div>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+try { $("token").value = localStorage.getItem("hpassToken") || ""; } catch (_) {}
+const token = () => $("token").value.trim();
+const api = (p, opt = {}) => fetch(p, { ...opt, headers: { ...(opt.headers || {}), authorization: "Bearer " + token() } });
+const msg = (t, bad) => { $("msg").textContent = t; $("msg").className = bad ? "kv bad" : "kv"; };
+const GRADE = { gray: "灰 · 没和别的路线重叠", green: "绿 · 对得上", yellow: "黄 · 有点对不上", red: "红 · 对不上" };
+const css = () => getComputedStyle(document.documentElement);
+const col = (n) => css().getPropertyValue(n).trim();
+
+// ---- 变换：p' = R(a) p + b（作用在原始位置上）----
+const T0 = { a: 0, bx: 0, by: 0 };
+function fromEdit(e) {
+  if (!e) return { ...T0 };
+  const a = (e.rotDeg || 0) * Math.PI / 180, c = Math.cos(a), s = Math.sin(a), px = e.pivotX || 0, py = e.pivotY || 0;
+  return { a, bx: px - (c * px - s * py) + (e.dx || 0), by: py - (s * px + c * py) + (e.dy || 0) };
+}
+const apply = (T, x, y) => { const c = Math.cos(T.a), s = Math.sin(T.a); return [c * x - s * y + T.bx, s * x + c * y + T.by]; };
+// D ∘ T
+function compose(D, T) { const c = Math.cos(D.a), s = Math.sin(D.a); return { a: D.a + T.a, bx: c * T.bx - s * T.by + D.bx, by: s * T.bx + c * T.by + D.by }; }
+const rotAbout = (u, cx, cy) => { const c = Math.cos(u), s = Math.sin(u); return { a: u, bx: cx - (c * cx - s * cy), by: cy - (s * cx + c * cy) }; };
+const toEdit = (T) => ({ dx: +T.bx.toFixed(1), dy: +T.by.toFixed(1), rotDeg: +(T.a * 180 / Math.PI).toFixed(3), pivotX: 0, pivotY: 0 });
+
+const st = { mapId: "", map: null, exp: null, segs: [], serverEdits: [], sel: null, undo: [], dirty: false,
+             view: { s: 0.05, ox: 20, oy: 20 }, hidden: new Set() };
+
+// ---- 载入 ----
+async function loadMapList() {
+  if (!token()) return;
+  try {
+    const r = await api("/api/packages"); if (!r.ok) { msg(r.status === 401 ? "口令不对" : "读地图列表失败", true); return; }
+    const list = await r.json();
+    const sel = $("mapSel"), last = (() => { try { return localStorage.getItem("hpassRoutesMap") || ""; } catch (_) { return ""; } })();
+    sel.innerHTML = '<option value="">选地图…</option>' + list.map((p) => `<option value="${esc(p.id)}">${esc(p.name || p.id)}（${p.kind === "room" ? "房间" : "商场"}）</option>`).join("");
+    if (last && list.some((p) => p.id === last)) sel.value = last;
+    else if (list.length) sel.value = list[0].id;
+  } catch (e) { msg("读地图列表失败：" + e, true); }
+}
+function esc(s) { return String(s ?? "").replace(/[<>&"']/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&#39;" }[c])); }
+
+async function load() {
+  try { localStorage.setItem("hpassToken", token()); } catch (_) {}
+  const id = $("mapSel").value; if (!id) { await loadMapList(); return; }
+  if (st.dirty && !confirm("有没保存的修改，确定重新载入？")) return;
+  try { localStorage.setItem("hpassRoutesMap", id); } catch (_) {}
+  msg("载入中…");
+  const [rm, rs, re] = await Promise.all([api("/api/maps/" + encodeURIComponent(id)), api("/api/segments/" + encodeURIComponent(id)), api("/api/config/segments/" + encodeURIComponent(id))]);
+  if (rm.ok) { let j = await rm.json(); if (j && j.data && j.data.mapElementList) j = j.data; st.map = parseMap(j); } else st.map = null;
+  if (!rs.ok) { st.exp = null; st.segs = []; render(); msg(rs.status === 404 ? "这张地图还没有分段数据：点「保存并重建地图」跑一次云端建图（约 3～5 分钟）后再载入" : "读分段数据失败", rs.status !== 404); st.mapId = id; updateButtons(); return; }
+  st.exp = await rs.json();
+  st.serverEdits = re.ok ? ((await re.json()).edits || []) : [];
+  st.mapId = id;
+  const key = (e) => e.session + "@" + e.t0Ms + "-" + e.t1Ms;
+  const local = new Map(st.serverEdits.map((e) => [key(e), e]));
+  st.segs = st.exp.segments.map((g, i) => {
+    const e = local.get(key(g));
+    const manual = !!(e && !e.deleted) || !!g.edit;
+    const T = e && !e.deleted ? fromEdit(e) : fromEdit(g.current || g.edit || g.auto);
+    const s = { i, id: g.id, session: g.session, driftM: g.driftM ?? null, t0Ms: g.t0Ms, t1Ms: g.t1Ms, lengthM: g.lengthM, raw: g.raw, auto: g.auto ? fromEdit(g.auto) : { ...T0 },
+                T, manual, deleted: e ? !!e.deleted : g.deleted, v: g.verdict };
+    s.orig = snap1(s);
+    return s;
+  });
+  // 段号：每遍里第几段
+  const cnt = {}; for (const s of st.segs) { cnt[s.session] = (cnt[s.session] || 0) + 1; s.no = cnt[s.session]; }
+  st.sel = null; st.undo = []; st.dirty = false; st.fitted = false;
+  recolor(); render(); renderPanel(); updateButtons();
+  const when = st.exp.builtMs ? new Date(st.exp.builtMs).toLocaleString("zh-CN", { hour12: false }) : "";
+  msg(`${st.segs.length} 段 · 分段数据 ${when} 生成`);
+}
+
+function parseMap(j) {
+  const shelves = [], crosses = [], walls = [];
+  for (const e of j.mapElementList || []) {
+    const w = +e.width || 0, h = +e.height || 0, r = (+e.rotation || 0) * Math.PI / 180;
+    if (e.shapeType === "MapShelf") {
+      const c = Math.cos(r), s = Math.sin(r);
+      shelves.push({ cx: +e.x + c * w / 2 - s * h / 2, cy: +e.y + s * w / 2 + c * h / 2, w, h, r });
+    } else if (e.shapeType === "MapCross" && e.points && e.points.length >= 4) {
+      crosses.push({ a: [e.points[0], e.points[1]], b: [e.points[2], e.points[3]], lw: +e.lineWidth || 0 });
+    } else if (["MapWall", "MapDoor", "MapWindow"].includes(e.shapeType)) {
+      walls.push({ cx: +e.x, cy: +e.y, w, h: Math.max(h, 8), r, type: e.shapeType });
+    }
+  }
+  const floor = (j.floorPolygons || []).map((p) => { const out = []; for (let i = 0; i + 1 < p.length; i += 2) out.push([p[i], p[i + 1]]); return out; });
+  return { width: +j.width || 1000, height: +j.height || 1000, shelves, crosses, walls, floor, name: j.floorName };
+}
+
+// ---- 一致性（和 HPASSKit SurveySegments.consistency 同一套规则）----
+function pts(s) { return s.raw.map((r) => { const [x, y] = apply(s.T, r[0], r[1]); return [x, y, r[2], r[3]]; }); }
+function recolor(withSuggest) {
+  const th = st.exp.thresholds, c = th.cellCm;
+  const P = st.segs.map(pts);
+  const own = P.map((ps) => { const m = new Map(); for (const [x, y, t, v] of ps) { const k = Math.floor(x / c) + "," + Math.floor(y / c); const e = m.get(k) || [0, 0, 0]; e[0]++; e[1] += t; e[2] += v; m.set(k, e); } return m; });
+  const all = new Map();
+  st.segs.forEach((s, k) => { if (s.deleted) return; for (const [key, e] of own[k]) { const a = all.get(key) || [0, 0, 0]; a[0] += e[0]; a[1] += e[1]; a[2] += e[2]; all.set(key, a); } });
+  const W = [[0, 0, 1], [1, 0, .5], [-1, 0, .5], [0, 1, .5], [0, -1, .5], [1, 1, .25], [1, -1, .25], [-1, 1, .25], [-1, -1, .25]];
+  function refAt(x, y, k, only) {
+    const i = Math.floor(x / c), j = Math.floor(y / c); let n = 0, t = 0, v = 0;
+    for (const [di, dj, w] of W) {
+      const key = (i + di) + "," + (j + dj);
+      let e;
+      if (only != null) e = own[only].get(key) || [0, 0, 0];
+      else { e = (all.get(key) || [0, 0, 0]).slice(); if (!st.segs[k].deleted) { const m = own[k].get(key); if (m) { e[0] -= m[0]; e[1] -= m[1]; e[2] -= m[2]; } } }
+      if (e[0] <= 0.5) continue;
+      n += w * e[0]; t += w * e[1]; v += w * e[2];
+    }
+    return n >= th.minRefWeight ? [t / n, v / n] : null;
+  }
+  const med = (a) => { const s = a.slice().sort((p, q) => p - q); return s.length ? s[s.length >> 1] : 0; };
+  function resid(k, dx, dy, only) {
+    const dt = [], dv = [];
+    for (const [x, y, t, v] of P[k]) { const q = refAt(x + dx, y + dy, k, only); if (!q) continue; dt.push(t - q[0]); dv.push(v - q[1]); }
+    if (!dt.length) return null;
+    const mt = med(dt), mv = med(dv);
+    return { r: med(dt.map((d, i) => (Math.abs(d - mt) + Math.abs(dv[i] - mv)) / 2)), n: dt.length };
+  }
+  st.segs.forEach((s, k) => {
+    const r0 = resid(k, 0, 0);
+    const v = { grade: "gray", overlapM: r0 ? Math.round(r0.n * 2.5) / 10 : 0, residualUT: null, conflicts: {}, suggestDx: null, suggestDy: null };
+    if (r0 && r0.n * 0.25 >= th.minOverlapM) {
+      // 和每段单独比；评定 = 加权下中位（至少和一半重叠的路线对得上才算绿），见 SurveySegments.consistency
+      const pair = [];
+      st.segs.forEach((o, j) => { if (j === k || o.deleted) return; const r = resid(k, 0, 0, j); if (r && r.n * 0.25 >= th.minOverlapM) pair.push({ id: o.id, r: r.r, n: r.n }); });
+      let score = r0.r;
+      if (pair.length) {
+        const sorted = pair.slice().sort((a, b) => a.r - b.r), half = sorted.reduce((a, x) => a + x.n, 0) / 2;
+        let acc = 0; for (const x of sorted) { acc += x.n; if (acc >= half) { score = x.r; break; } }
+      }
+      v.residualUT = Math.round(score * 100) / 100;
+      v.grade = score <= th.greenUT ? "green" : score <= th.yellowUT ? "yellow" : "red";
+      for (const x of pair.filter((x) => x.r > th.greenUT).sort((a, b) => b.r - a.r).slice(0, 5)) v.conflicts[x.id] = Math.round(x.r * 10) / 10;
+      v.partners = pair.length;
+      // 谁更可能错：离真值点（起点 / 长按修正）走得越远越可能漂偏（同 SurveySegments.consistency）
+      if (v.grade !== "green" && s.driftM != null) {
+        let me = 0, them = 0;
+        for (const x of pair) {
+          if (x.r <= th.greenUT) continue;
+          const o = st.segs.find((y) => y.id === x.id); if (!o || o.driftM == null) continue;
+          if (s.driftM - o.driftM >= 5) me += x.n; else if (o.driftM - s.driftM >= 5) them += x.n;
+        }
+        v.likelyWrong = me > them ? true : them > me ? false : null;
+      }
+      if (withSuggest === k && v.grade !== "green") {
+        // 不能挪出可走区域（地图有地面多边形时；同 SurveySegments.consistency）
+        const inside = (dx, dy) => { if (!st.map || !st.map.floor.length) return 1; let n = 0; for (const [x, y] of P[k]) if (inFloor(x + dx, y + dy)) n++; return n / Math.max(P[k].length, 1); };
+        const in0 = inside(0, 0);
+        let best = { dx: 0, dy: 0, r: r0.r, sc: r0.r };
+        for (let ix = -6; ix <= 6; ix++) for (let iy = -6; iy <= 6; iy++) {
+          if (!ix && !iy) continue;
+          const dx = ix * 25, dy = iy * 25, r = resid(k, dx, dy);
+          if (!r || r.n < r0.n * 0.7 || inside(dx, dy) < in0 - 0.1) continue;
+          const sc = r.r + 0.002 * Math.hypot(dx, dy);
+          if (sc < best.sc) best = { dx, dy, r: r.r, sc };
+        }
+        if (best.r <= r0.r * 0.7 && best.r <= th.greenUT * 1.5 && Math.hypot(best.dx, best.dy) >= 50) { v.suggestDx = best.dx; v.suggestDy = best.dy; v.suggestResidualUT = Math.round(best.r * 100) / 100; }
+      }
+    }
+    s.v = v;
+  });
+}
+
+function inFloor(x, y) {
+  for (const poly of st.map.floor) {
+    let c = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const [xi, yi] = poly[i], [xj, yj] = poly[j];
+      if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) c = !c;
+    }
+    if (c) return true;
+  }
+  return false;
+}
+
+// ---- 松手自动吸附：人粗放、机器精调 ----
+// 在 ±50 cm（10 cm 步长）、±3°（1° 步长）里找这组段和别的段（不含这组、不含删掉的）磁场最吻合的位置
+function snapGroup(g) {
+  const th = st.exp.thresholds, c = th.cellCm, ids = new Set(g.map((s) => s.i));
+  const ref = new Map();
+  st.segs.forEach((s) => { if (ids.has(s.i) || s.deleted) return; for (const [x, y, t, v] of pts(s)) { const k = Math.floor(x / c) + "," + Math.floor(y / c); const e = ref.get(k) || [0, 0, 0]; e[0]++; e[1] += t; e[2] += v; ref.set(k, e); } });
+  const W = [[0, 0, 1], [1, 0, .5], [-1, 0, .5], [0, 1, .5], [0, -1, .5], [1, 1, .25], [1, -1, .25], [-1, 1, .25], [-1, -1, .25]];
+  const refAt = (x, y) => { const i = Math.floor(x / c), j = Math.floor(y / c); let n = 0, t = 0, v = 0; for (const [di, dj, w] of W) { const e = ref.get((i + di) + "," + (j + dj)); if (!e) continue; n += w * e[0]; t += w * e[1]; v += w * e[2]; } return n >= th.minRefWeight ? [t / n, v / n] : null; };
+  const med = (a) => { const s = a.slice().sort((p, q) => p - q); return s.length ? s[s.length >> 1] : 0; };
+  const P = g.flatMap((s) => pts(s));
+  if (P.length < 4) return null;
+  let cx = 0, cy = 0; for (const q of P) { cx += q[0]; cy += q[1]; } cx /= P.length; cy /= P.length;
+  const hasFloor = st.map && st.map.floor.length;
+  function cost(D) {
+    const dt = [], dv = []; let inside = 0;
+    for (const [x0, y0, t, v] of P) {
+      const [x, y] = apply(D, x0, y0);
+      if (hasFloor && inFloor(x, y)) inside++;
+      const q = refAt(x, y); if (!q) continue; dt.push(t - q[0]); dv.push(v - q[1]);
+    }
+    if (!dt.length) return null;
+    const mt = med(dt), mv = med(dv);
+    return { r: med(dt.map((d, i) => (Math.abs(d - mt) + Math.abs(dv[i] - mv)) / 2)), n: dt.length, inside: hasFloor ? inside / P.length : 1 };
+  }
+  const c0 = cost(T0);
+  if (!c0 || c0.n * 0.25 < th.minOverlapM) return null;
+  let best = { D: T0, r: c0.r, sc: c0.r };
+  for (let a = -3; a <= 3; a++) for (let ix = -5; ix <= 5; ix++) for (let iy = -5; iy <= 5; iy++) {
+    if (!a && !ix && !iy) continue;
+    const R = rotAbout(a * Math.PI / 180, cx, cy), D = compose({ a: 0, bx: ix * 10, by: iy * 10 }, R);
+    const k = cost(D);
+    if (!k || k.n < c0.n * 0.7 || k.inside < c0.inside - 0.05) continue;
+    const sc = k.r + 0.002 * Math.hypot(ix * 10, iy * 10) + 0.05 * Math.abs(a);
+    if (sc < best.sc) best = { D, r: k.r, sc, a, dx: ix * 10, dy: iy * 10 };
+  }
+  if (best.D === T0 || best.r > c0.r * 0.9) return null;
+  return { ...best, r0: c0.r };
+}
+
+// ---- 画 ----
+const cv = $("cv"), ctx = cv.getContext("2d");
+function bounds() {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  if (st.map) { x0 = 0; y0 = 0; x1 = st.map.width; y1 = st.map.height; }
+  for (const s of st.segs) for (const [x, y] of pts(s)) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+  return isFinite(x0) ? [x0, y0, x1, y1] : [0, 0, 1000, 1000];
+}
+function fit() {
+  const W = cv.clientWidth, H = cv.clientHeight, [x0, y0, x1, y1] = bounds(), v = st.view;
+  v.s = Math.min(W / (x1 - x0 + 100), H / (y1 - y0 + 100)) * 0.95;
+  v.ox = (W - (x1 + x0) * v.s) / 2; v.oy = (H - (y1 + y0) * v.s) / 2;
+}
+const X = (x) => st.view.ox + x * st.view.s, Y = (y) => st.view.oy + y * st.view.s;
+const gradeCol = (g) => col("--" + g);
+function centroid(list) { let n = 0, sx = 0, sy = 0; for (const s of list) for (const [x, y] of pts(s)) { sx += x; sy += y; n++; } return n ? [sx / n, sy / n] : [0, 0]; }
+function group() { if (st.sel == null) return []; const s = st.segs[st.sel]; return $("whole").checked ? st.segs.filter((o) => o.session === s.session) : [s]; }
+function handlePos() {
+  const g = group(); if (!g.length) return null;
+  const [cx, cy] = centroid(g);
+  let far = 0, fx = cx, fy = cy;
+  for (const s of g) for (const [x, y] of pts(s)) { const d = Math.hypot(x - cx, y - cy); if (d > far) { far = d; fx = x; fy = y; } }
+  const L = Math.max(far, 1), k = (far * st.view.s + 26) / (L * st.view.s);
+  return { cx, cy, hx: cx + (fx - cx) * k, hy: cy + (fy - cy) * k };
+}
+function render() {
+  const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (!st.fitted && (st.map || st.segs.length)) { fit(); st.fitted = true; }
+  ctx.fillStyle = col("--panel"); ctx.fillRect(0, 0, W, H);
+  const v = st.view, m = st.map;
+  if (m && $("showMap").checked) {
+    ctx.fillStyle = col("--floor");
+    for (const p of m.floor) { ctx.beginPath(); p.forEach(([x, y], i) => (i ? ctx.lineTo(X(x), Y(y)) : ctx.moveTo(X(x), Y(y)))); ctx.closePath(); ctx.fill(); }
+    ctx.strokeStyle = col("--cross"); ctx.lineCap = "round";
+    for (const c of m.crosses) { ctx.lineWidth = Math.max(c.lw * v.s, 1); ctx.beginPath(); ctx.moveTo(X(c.a[0]), Y(c.a[1])); ctx.lineTo(X(c.b[0]), Y(c.b[1])); ctx.stroke(); }
+    const rect = (o, fill) => { ctx.save(); ctx.translate(X(o.cx), Y(o.cy)); ctx.rotate(o.r); ctx.fillStyle = fill; ctx.fillRect(-o.w * v.s / 2, -o.h * v.s / 2, o.w * v.s, o.h * v.s); ctx.restore(); };
+    for (const s of m.shelves) rect(s, col("--shelf"));
+    for (const w of m.walls) rect(w, w.type === "MapWall" ? col("--wall") : w.type === "MapDoor" ? "#a16207" : "#22d3ee");
+  }
+  const selSet = new Set(group().map((s) => s.i));
+  const order = st.segs.slice().sort((a, b) => (selSet.has(a.i) ? 1 : 0) - (selSet.has(b.i) ? 1 : 0));
+  for (const s of order) {
+    if (st.hidden.has(s.session)) continue;
+    if (s.deleted && !$("showDel").checked) continue;
+    const p = pts(s); if (p.length < 2) continue;
+    const sel = selSet.has(s.i);
+    ctx.lineJoin = "round"; ctx.lineCap = "round";
+    if (sel) { ctx.strokeStyle = col("--accent"); ctx.globalAlpha = .35; ctx.lineWidth = 10; ctx.setLineDash([]); line(p); ctx.globalAlpha = 1; }
+    ctx.strokeStyle = s.deleted ? col("--gray") : gradeCol(s.v.grade);
+    ctx.lineWidth = s.deleted ? 1.5 : sel ? 4 : 3;
+    ctx.setLineDash(s.deleted ? [5, 5] : []);
+    line(p); ctx.setLineDash([]);
+    // 末端箭头（走的方向）
+    const a = p[p.length - 2], b = p[p.length - 1], ang = Math.atan2(Y(b[1]) - Y(a[1]), X(b[0]) - X(a[0]));
+    ctx.fillStyle = ctx.strokeStyle; ctx.beginPath(); ctx.moveTo(X(b[0]), Y(b[1]));
+    ctx.lineTo(X(b[0]) - 9 * Math.cos(ang - .45), Y(b[1]) - 9 * Math.sin(ang - .45)); ctx.lineTo(X(b[0]) - 9 * Math.cos(ang + .45), Y(b[1]) - 9 * Math.sin(ang + .45)); ctx.fill();
+    if (s.manual && !s.deleted) { ctx.beginPath(); ctx.arc(X(p[0][0]), Y(p[0][1]), 3.5, 0, 7); ctx.fill(); }
+    if (s.v.likelyWrong && !s.deleted) {   // 更可能是这段错：中间画个「!」
+      const m = p[p.length >> 1];
+      ctx.fillStyle = gradeCol(s.v.grade); ctx.beginPath(); ctx.arc(X(m[0]), Y(m[1]), 8, 0, 7); ctx.fill();
+      ctx.fillStyle = "#fff"; ctx.font = "bold 12px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText("!", X(m[0]), Y(m[1]) + 1);
+      ctx.textAlign = "start"; ctx.textBaseline = "alphabetic";
+    }
+  }
+  // 建议位置（虚线）
+  if (st.sel != null) {
+    const s = st.segs[st.sel];
+    if (s.v.suggestDx != null && !s.deleted) {
+      ctx.strokeStyle = col("--green"); ctx.lineWidth = 2; ctx.setLineDash([3, 4]);
+      line(pts(s).map(([x, y]) => [x + s.v.suggestDx, y + s.v.suggestDy])); ctx.setLineDash([]);
+    }
+    const h = handlePos();
+    if (h) {
+      ctx.strokeStyle = col("--accent"); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(X(h.cx), Y(h.cy)); ctx.lineTo(X(h.hx), Y(h.hy)); ctx.stroke();
+      ctx.fillStyle = col("--panel"); ctx.beginPath(); ctx.arc(X(h.hx), Y(h.hy), 9, 0, 7); ctx.fill(); ctx.lineWidth = 2; ctx.stroke();
+      ctx.fillStyle = col("--accent"); ctx.font = "12px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText("⟳", X(h.hx), Y(h.hy) + 1);
+      ctx.textAlign = "start"; ctx.textBaseline = "alphabetic";
+    }
+  }
+  // 比例尺
+  const meters = [1, 2, 5, 10, 20, 50].find((mm) => mm * 100 * v.s >= 60) || 50;
+  ctx.strokeStyle = col("--muted"); ctx.fillStyle = col("--muted"); ctx.lineWidth = 2; ctx.font = "11px sans-serif";
+  ctx.beginPath(); ctx.moveTo(12, 16); ctx.lineTo(12 + meters * 100 * v.s, 16); ctx.stroke(); ctx.fillText(meters + " m", 14, 30);
+}
+function line(p) { ctx.beginPath(); p.forEach(([x, y], i) => (i ? ctx.lineTo(X(x), Y(y)) : ctx.moveTo(X(x), Y(y)))); ctx.stroke(); }
+
+// ---- 面板 ----
+const short = (name) => name.replace(/^ios_survey_/, "").replace(/^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})$/, "$2-$3 $4:$5:$6");
+function renderPanel() {
+  const n = { gray: 0, green: 0, yellow: 0, red: 0, deleted: 0 };
+  for (const s of st.segs) n[s.deleted ? "deleted" : s.v.grade]++;
+  $("legend").innerHTML = ["green", "yellow", "red", "gray"].map((g) => `<span><i class="chip" style="background:${gradeCol(g)}"></i>${GRADE[g].split(" · ")[1]} ${n[g]}</span>`).join("") +
+    `<span><i class="chip" style="border:1px dashed ${col("--gray")}"></i>删掉 ${n.deleted}</span>` +
+    (() => {
+      const live = st.segs.filter((s) => !s.deleted);
+      const lone = live.filter((s) => s.v.grade === "gray").length;
+      const tie = live.filter((s) => s.v.grade !== "green" && s.v.grade !== "gray" && (s.v.partners || 0) < 2).length;
+      const wrong = live.filter((s) => s.v.likelyWrong).length;
+      const parts = [];
+      if (wrong) parts.push(`${wrong} 段标了「!」：和它对不上的路线离起点 / 修正点更近，更可能是这段漂偏了`);
+      if (lone) parts.push(`${lone} 段只走过一遍（灰），下次采集从中间横穿或重叠走 3 m 以上就能验证`);
+      if (tie) parts.push(`${tie} 段只和 1 条路线比过、对不上，再走一条经过那里的路线就能少数服从多数`);
+      return parts.length ? `<div class="kv" style="margin-top:6px">${parts.map((x) => "· " + x).join("<br>")}</div>` : "";
+    })();
+  const by = {}; for (const s of st.segs) (by[s.session] = by[s.session] || []).push(s);
+  const sessInfo = Object.fromEntries((st.exp?.sessions || []).map((x) => [x.name, x]));
+  $("sessions").innerHTML = Object.keys(by).map((name) => {
+    const q = sessInfo[name];
+    return `<div class="sess"><div class="name"><input type="checkbox" data-hide="${esc(name)}" ${st.hidden.has(name) ? "" : "checked"}><b>${esc(short(name))}</b>
+      ${q && !q.kept ? `<span class="bad" title="${esc(q.reason || "")}">上次建图整遍没用</span>` : ""}</div>
+      <div class="segs">${by[name].map((s) => `<button data-seg="${s.i}" class="${s.i === st.sel ? "sel" : ""} ${s.deleted ? "del" : ""}" style="border-color:${s.deleted ? col("--gray") : gradeCol(s.v.grade)}">${s.no}${s.manual ? "*" : ""}</button>`).join("")}</div></div>`;
+  }).join("") || "这张地图没有分段数据。";
+  const s = st.sel != null ? st.segs[st.sel] : null;
+  $("selTools").hidden = !s;
+  if (!s) { $("selInfo").textContent = "还没选。点地图上的一段路线。"; return; }
+  const name = (id) => { const o = st.segs.find((x) => x.id === id); return o ? `${short(o.session)} 第 ${o.no} 段` : id; };
+  const conf = Object.entries(s.v.conflicts || {}).sort((a, b) => b[1] - a[1]);
+  $("selInfo").innerHTML = `<b>${esc(short(s.session))} 第 ${s.no} 段</b> · ${s.lengthM} m${s.manual ? " · 手动摆过" : ""}${s.deleted ? " · <span class=bad>已删</span>" : ""}<br>
+    <span style="color:${gradeCol(s.v.grade)}">●</span> ${GRADE[s.v.grade]}${s.v.residualUT != null ? `（残差 ${s.v.residualUT} µT，重叠 ${s.v.overlapM} m）` : s.v.overlapM ? `（重叠 ${s.v.overlapM} m，不够 ${st.exp.thresholds.minOverlapM} m）` : ""}
+    ${s.v.likelyWrong === true ? `<br><b style="color:${gradeCol(s.v.grade)}">! 更可能是这段错</b>：它离起点 / 修正点走了 ${s.driftM} m，和它对不上的路线更近` : ""}
+    ${s.v.likelyWrong === false ? `<br>对不上的路线离起点 / 修正点更远（这段 ${s.driftM} m），更可能是对方错，先看对方` : ""}
+    ${s.v.grade === "gray" && !s.deleted ? "<br>只走过一遍，没法验证。下次采集从这段中间横穿或重叠走 3 m 以上。" : ""}
+    ${s.v.grade !== "green" && s.v.grade !== "gray" && (s.v.partners || 0) < 2 ? "<br>只和 1 条路线比过，磁场本身分不出谁错：再走一条经过这里的路线来裁决。" : ""}
+    ${conf.length ? `<br>对不上的：${conf.map(([id, r]) => `<a href="#" data-goto="${esc(id)}">${esc(name(id))}</a> ${r} µT`).join("、")}` : ""}`;
+  const sg = $("sug");
+  sg.hidden = s.v.suggestDx == null || s.deleted;
+  if (!sg.hidden) sg.textContent = `按建议挪 ${s.v.suggestDx > 0 ? "→" : s.v.suggestDx < 0 ? "←" : ""}${Math.abs(s.v.suggestDx)} ${s.v.suggestDy > 0 ? "↓" : s.v.suggestDy < 0 ? "↑" : ""}${Math.abs(s.v.suggestDy)} cm（残差 → ${s.v.suggestResidualUT} µT）`;
+  $("del").textContent = s.deleted ? "恢复这段" : "删除这段";
+  $("reset").disabled = !s.manual;
+}
+function updateButtons() { $("undo").disabled = !st.undo.length; $("save").disabled = !st.dirty || !st.exp; $("saveBuild").disabled = !st.mapId; }
+
+// ---- 修改 ----
+const snap1 = (s) => ({ T: { ...s.T }, manual: s.manual, deleted: s.deleted });
+function pushUndo(list) { st.undo.push(list.map((s) => ({ i: s.i, ...snap1(s) }))); if (st.undo.length > 200) st.undo.shift(); }
+function changed() { st.dirty = true; recolor(st.sel); render(); renderPanel(); updateButtons(); }
+function transformGroup(D) { for (const s of group()) { s.T = compose(D, s.T); s.manual = true; } }
+function select(i) { st.sel = i; if (i != null) recolor(i); render(); renderPanel(); }
+
+$("undo").onclick = () => { const u = st.undo.pop(); if (!u) return; for (const x of u) Object.assign(st.segs[x.i], { T: x.T, manual: x.manual, deleted: x.deleted }); changed(); };
+$("del").onclick = () => { const g = group(); if (!g.length) return; pushUndo(g); const d = !st.segs[st.sel].deleted; for (const s of g) s.deleted = d; changed(); };
+$("reset").onclick = () => { const g = group(); pushUndo(g); for (const s of g) { s.T = { ...s.auto }; s.manual = false; } changed(); };
+$("sug").onclick = () => { const s = st.segs[st.sel]; if (s.v.suggestDx == null) return; pushUndo([s]); s.T = compose({ a: 0, bx: s.v.suggestDx, by: s.v.suggestDy }, s.T); s.manual = true; changed(); };
+function nudge(k, big) {
+  if (st.sel == null) return;
+  const d = big ? 50 : 10, g = group(); pushUndo(g);
+  if (k === "rl" || k === "rr") { const [cx, cy] = centroid(g); transformGroup(rotAbout((k === "rr" ? 0.5 : -0.5) * Math.PI / 180, cx, cy)); }
+  else transformGroup({ a: 0, bx: k === "l" ? -d : k === "r" ? d : 0, by: k === "u" ? -d : k === "d" ? d : 0 });
+  changed();
+}
+for (const b of document.querySelectorAll("[data-n]")) b.onclick = () => nudge(b.dataset.n, false);
+$("sessions").onclick = (e) => {
+  const b = e.target.closest("[data-seg]"); if (b) { select(+b.dataset.seg); return; }
+  const h = e.target.closest("[data-hide]"); if (h) { if (h.checked) st.hidden.delete(h.dataset.hide); else st.hidden.add(h.dataset.hide); render(); }
+};
+$("selInfo").onclick = (e) => { const a = e.target.closest("[data-goto]"); if (!a) return; e.preventDefault(); const o = st.segs.find((x) => x.id === a.dataset.goto); if (o) select(o.i); };
+for (const id of ["showDel", "showMap", "whole"]) $(id).onchange = () => render();
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  if ((e.ctrlKey || e.metaKey) && e.key === "z") { e.preventDefault(); $("undo").click(); return; }
+  const k = { ArrowLeft: "l", ArrowRight: "r", ArrowUp: "u", ArrowDown: "d", q: "rl", e: "rr", Q: "rl", E: "rr" }[e.key];
+  if (k && st.sel != null) { e.preventDefault(); nudge(k, e.shiftKey); }
+  else if ((e.key === "Delete" || e.key === "Backspace") && st.sel != null) { e.preventDefault(); $("del").click(); }
+  else if (e.key === "Escape") select(null);
+});
+
+// ---- 保存 ----
+async function save(rebuild) {
+  if (!st.mapId) return;
+  if (st.exp) {
+    const key = (e) => e.session + "@" + e.t0Ms + "-" + e.t1Ms;
+    const mine = new Set(st.segs.map(key));
+    const edits = st.serverEdits.filter((e) => !mine.has(key(e)));   // 这次没显示的段（比如整遍被排除的）原样保留
+    // 一遍里有段改过：整遍按现在看到的位置固定下来（否则重建时没改的段会被自动对齐重新挪，看到的和建出来的不一样）
+    const touched = new Set(st.segs.filter((s) => s.manual || s.deleted).map((s) => s.session));
+    for (const s of st.segs) {
+      if (!touched.has(s.session)) continue;
+      s.manual = !s.deleted || s.manual;
+      const e = { session: s.session, t0Ms: s.t0Ms, t1Ms: s.t1Ms, ...toEdit(s.T) };
+      if (s.deleted) e.deleted = true;
+      edits.push(e);
+    }
+    msg("保存中…");
+    const r = await api("/api/config/segments/" + encodeURIComponent(st.mapId), { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ edits }) });
+    if (!r.ok) { msg("保存失败：" + ((await r.json().catch(() => ({}))).error || r.status), true); return; }
+    st.serverEdits = edits; st.dirty = false; updateButtons();
+    msg(`已保存（${edits.filter((e) => !e.deleted).length} 段手动摆过、${edits.filter((e) => e.deleted).length} 段删掉）`);
+  }
+  if (rebuild) {
+    const r = await api("/api/rebuild", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ map_id: st.mapId, force: true }) });
+    const j = await r.json().catch(() => ({}));
+    msg(r.ok ? (st.exp ? "已保存，" : "") + (j.message || "已开始重建") + "；重建完再点「载入」看新颜色" : "重建没启动：" + (j.error || r.status), !r.ok);
+  }
+}
+$("save").onclick = () => save(false);
+$("saveBuild").onclick = () => save(true);
+$("load").onclick = load;
+$("mapSel").onchange = load;
+window.addEventListener("beforeunload", (e) => { if (st.dirty) { e.preventDefault(); e.returnValue = ""; } });
+
+// ---- 指针：选中 / 挪 / 转 / 平移 / 双指缩放 ----
+const ptrs = new Map();
+let drag = null;
+function toMap(e) { const r = cv.getBoundingClientRect(); const sx = e.clientX - r.left, sy = e.clientY - r.top; return { sx, sy, x: (sx - st.view.ox) / st.view.s, y: (sy - st.view.oy) / st.view.s }; }
+function hit(sx, sy) {
+  let best = null, bd = 14;
+  for (const s of st.segs) {
+    if (st.hidden.has(s.session) || (s.deleted && !$("showDel").checked)) continue;
+    const p = pts(s);
+    for (let i = 1; i < p.length; i++) {
+      const ax = X(p[i - 1][0]), ay = Y(p[i - 1][1]), bx = X(p[i][0]), by = Y(p[i][1]);
+      const dx = bx - ax, dy = by - ay, L = dx * dx + dy * dy || 1;
+      const t = Math.max(0, Math.min(1, ((sx - ax) * dx + (sy - ay) * dy) / L));
+      const d = Math.hypot(sx - ax - t * dx, sy - ay - t * dy);
+      if (d < bd) { bd = d; best = s.i; }
+    }
+  }
+  return best;
+}
+cv.onpointerdown = (e) => {
+  cv.setPointerCapture(e.pointerId);
+  ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (ptrs.size === 2) { drag = { mode: "pinch" }; return; }
+  const p = toMap(e);
+  const h = handlePos();
+  if (h && Math.hypot(p.sx - X(h.hx), p.sy - Y(h.hy)) < 16) {
+    pushUndo(group());
+    drag = { mode: "rot", cx: h.cx, cy: h.cy, ang: Math.atan2(p.y - h.cy, p.x - h.cx), moved: false };
+    return;
+  }
+  const k = hit(p.sx, p.sy);
+  if (k != null && (k === st.sel || group().some((s) => s.i === k))) { pushUndo(group()); drag = { mode: "move", x: p.x, y: p.y, moved: false }; return; }
+  if (k != null) { select(k); pushUndo(group()); drag = { mode: "move", x: p.x, y: p.y, moved: false }; return; }
+  drag = { mode: "pan", sx: e.clientX, sy: e.clientY, moved: false };
+};
+cv.onpointermove = (e) => {
+  if (!ptrs.has(e.pointerId)) return;
+  const prev = ptrs.get(e.pointerId);
+  ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (!drag) return;
+  if (drag.mode === "pinch" && ptrs.size === 2) {
+    const [a, b] = [...ptrs.values()];
+    const other = [...ptrs.entries()].find(([id]) => id !== e.pointerId)[1];
+    const d0 = Math.hypot(prev.x - other.x, prev.y - other.y), d1 = Math.hypot(a.x - b.x, a.y - b.y);
+    if (d0 > 0) { const r = cv.getBoundingClientRect(); zoomAt((a.x + b.x) / 2 - r.left, (a.y + b.y) / 2 - r.top, d1 / d0); }
+    return;
+  }
+  const p = toMap(e);
+  if (drag.mode === "pan") { st.view.ox += e.clientX - drag.sx; st.view.oy += e.clientY - drag.sy; drag.sx = e.clientX; drag.sy = e.clientY; drag.moved = true; render(); }
+  else if (drag.mode === "move") { transformGroup({ a: 0, bx: p.x - drag.x, by: p.y - drag.y }); drag.x = p.x; drag.y = p.y; drag.moved = true; render(); }
+  else if (drag.mode === "rot") { const a = Math.atan2(p.y - drag.cy, p.x - drag.cx); transformGroup(rotAbout(a - drag.ang, drag.cx, drag.cy)); drag.ang = a; drag.moved = true; render(); }
+};
+cv.onpointerup = cv.onpointercancel = (e) => {
+  ptrs.delete(e.pointerId);
+  if (!drag) return;
+  const d = drag; drag = ptrs.size ? { mode: "pan", sx: [...ptrs.values()][0].x, sy: [...ptrs.values()][0].y } : null;
+  if (d.mode === "move" || d.mode === "rot") {
+    if (!d.moved) { st.undo.pop(); updateButtons(); return; }
+    let note = "";
+    if ($("snap").checked) {
+      const g = group(), sn = snapGroup(g);
+      if (sn) { for (const s of g) s.T = compose(sn.D, s.T); note = `已自动吸附：再挪 ${sn.dx} , ${sn.dy} cm、转 ${sn.a}°，残差 ${sn.r0.toFixed(1)} → ${sn.r.toFixed(1)} µT`; }
+    }
+    changed(); if (note) msg(note);
+  }
+  else if (d.mode === "pan" && !d.moved && ptrs.size === 0) select(null);
+};
+function zoomAt(mx, my, k) { const v = st.view; v.ox = mx - (mx - v.ox) * k; v.oy = my - (my - v.oy) * k; v.s *= k; render(); }
+cv.onwheel = (e) => { e.preventDefault(); const r = cv.getBoundingClientRect(); zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-e.deltaY * 0.0015)); };
+$("zin").onclick = () => zoomAt(cv.clientWidth / 2, cv.clientHeight / 2, 1.4);
+$("zout").onclick = () => zoomAt(cv.clientWidth / 2, cv.clientHeight / 2, 1 / 1.4);
+$("zfit").onclick = () => { fit(); render(); };
+window.onresize = () => { st.fitted = false; render(); };
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { render(); renderPanel(); });
+render();
+loadMapList().then(() => { if ($("mapSel").value && token()) load(); });
+</script>
+</body>
+</html>

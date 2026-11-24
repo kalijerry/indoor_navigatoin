@@ -70,6 +70,9 @@ npx wrangler dev        # http://localhost:8787
 | GET | `/api/logs?day=YYYY-MM-DD`、`/api/logs/<key>` | 日志分块（NDJSON，每 200 条或 30 秒一块） |
 | POST | `/api/rebuild` | 触发云端建图（map-build.yml），JSON `{"map_id": "...", "force": true}`，map_id 省略 = 全部；要 Worker secret `GH_TOKEN` |
 | PUT/GET | `/api/config/exclude` | 云端建图不用的会话名（JSON 数组），cloud_build.py 每次合并进 EXCLUDE |
+| GET | `/routes` | 建图路线页：每遍采集按拐弯切成段，拖动 / 旋转 / 删除，按磁场一致性着色（见 docs/survey-route-consistency.md） |
+| PUT/GET | `/api/segments/<地图>` | 云端建图导出的路线分段和着色（cloud_build.py 传，路线页读） |
+| PUT/GET | `/api/config/segments/<地图>` | 路线页手动改过的段 `{"edits":[{session,t0Ms,t1Ms,dx,dy,rotDeg,pivotX,pivotY,deleted}]}`，cloud_build.py 传给 hpass-build `--edits` |
 | GET | `/api/packages` | 云端地图包列表（名字、类型、版本、大小、磁场格数、蓝牙标签数） |
 | PUT/GET | `/api/packages/<地图编号>` | 地图包（App 打包：地图 + 磁场 + 蓝牙 + 视觉特征地图，zlib 压缩）；上传头 `X-Map-Name`（URL 编码）、`X-Map-Kind`、`X-Map-Version`（毫秒），比云端旧的版本返回 409 |
 
