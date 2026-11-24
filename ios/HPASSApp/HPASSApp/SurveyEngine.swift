@@ -378,7 +378,7 @@ final class SurveyEngine: ObservableObject {
     /// 这次采集该隔多少米修正一次
     var anchorIntervalM: Double { MapLibrary.shared.active?.isRoom == true ? Self.roomAnchorEveryM : Self.anchorEveryM }
     /// 走过修正间隔还没修正（界面上提醒长按）
-    var needsAnchor: Bool { stage == .tracking && walkedSinceAnchorM > anchorIntervalM }
+    var needsAnchor: Bool { stage == .tracking && !checkpointMode && walkedSinceAnchorM > anchorIntervalM }   // 打卡实验时不提示修正（中途修正会让真值实验不准）
     /// 上次震动提醒时「距上次修正」的米数，每多走一个间隔再震一次
     private var lastAnchorNagM = 0.0
     /// 长按时吸附到路点 / 点位的半径（cm）
@@ -463,6 +463,12 @@ final class SurveyEngine: ObservableObject {
     @Published var evaluate = false
     /// 这次是「测试会话」：只用来测精度，不参与生成磁场图（避免自己考自己）
     @Published var isTestSession = false
+    /// 精度实验「过点打卡」：起点照常长按；之后长按地图 = 我现在正好在这个已知点上（地上贴的胶带），
+    /// 只记一行 `checkpoint` 到 anchors.csv（地图坐标 = 长按的点、ARKit 坐标 = 此刻、备注里是当时 App 估计的位置），
+    /// **不修正位置、不参与离线对齐**（对齐只用 start / reanchor）。离线拿它当真值算每遍误差，
+    /// 见 docs/route-verification-research.md 第 7 节、tools/research/route_verification/checkpoints.py
+    @Published var checkpointMode = false
+    @Published private(set) var checkpointCount = 0
     @Published private(set) var shadowStatus: String?
     @Published private(set) var evalSummary: String?
     private(set) var evaluator = LocalizationEvaluator()
@@ -578,6 +584,7 @@ final class SurveyEngine: ObservableObject {
             "map_width_cm": store.widthCm, "map_height_cm": store.heightCm,
             "map_id": MapLibrary.shared.activeId ?? "",
             "purpose": isTestSession ? "test" : "build",
+            "checkpoint_mode": checkpointMode,
             "zone": coverage.zoneId ?? 0,
             "zone_name": coverage.zone?.name ?? "",
             "arkit": true,
@@ -641,6 +648,7 @@ final class SurveyEngine: ObservableObject {
         position = nil
         trail = []
         anchorCount = 0
+        checkpointCount = 0
         walkedSinceAnchorM = 0
         totalWalkedM = 0
         latestA = nil
@@ -727,6 +735,12 @@ final class SurveyEngine: ObservableObject {
             trail = [p]
             writeAnchor(kind: "start", map: p, ar: a, heading: nil, note: snapLabel ?? "")
             stage = .needHeading
+        case .aligning where checkpointMode, .tracking where checkpointMode:
+            // 过点打卡：只记真值点，不动位置
+            let est = position
+            writeAnchor(kind: "checkpoint", map: p, ar: a, heading: nil,
+                        note: (snapLabel ?? "") + (est.map { " 估计 \(Fmt.f($0.x, 1)) \(Fmt.f($0.y, 1)) 偏 \(Int($0.distance(to: p))) cm" } ?? ""))
+            checkpointCount += 1
         case .aligning, .tracking:
             // 修正：不改旋转，只把位置拉到 p
             let before = position
@@ -1162,7 +1176,7 @@ final class SurveyEngine: ObservableObject {
             heading.map { Fmt.f($0, 4) } ?? "", Fmt.csv(note),
         ].joined(separator: ","))
         anchorsWriter?.flush()
-        anchorCount += 1
+        if kind != "checkpoint" { anchorCount += 1 }
     }
 }
 

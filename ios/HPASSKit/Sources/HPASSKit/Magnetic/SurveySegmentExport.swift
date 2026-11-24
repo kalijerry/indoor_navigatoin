@@ -49,6 +49,9 @@ public struct SurveySegmentExport: Codable {
         public var minOverlapM: Double
         public var greenUT: Double
         public var yellowUT: Double
+        /// 「能不能验证」的试挪距离（cm）和残差至少要涨多少（µT），见 SurveySegments.ConsistencyConfig
+        public var probeCm: Double? = nil
+        public var minContrastUT: Double? = nil
     }
 
     public var version = 1
@@ -130,7 +133,10 @@ public struct SurveySegmentExport: Codable {
         var counts: [String: Int] = [:]
         for i in segs.indices {
             segs[i].verdict = verdicts[i]
-            if !segs[i].deleted { counts[verdicts[i].grade.rawValue, default: 0] += 1 } else { counts["deleted", default: 0] += 1 }
+            if !segs[i].deleted {
+                counts[verdicts[i].grade.rawValue, default: 0] += 1
+                if verdicts[i].flat == true { counts["flat", default: 0] += 1 }   // 灰里「对得上但验证不了」的
+            } else { counts["deleted", default: 0] += 1 }
         }
         let ss = sessions.map { s -> Session in
             let q = quality[s.name]
@@ -138,7 +144,8 @@ public struct SurveySegmentExport: Codable {
         }
         return SurveySegmentExport(mapId: mapId, builtMs: Int64((Date().timeIntervalSince1970 * 1000).rounded()),
                                    thresholds: .init(cellCm: consistency.cellCm, minRefWeight: consistency.minRefWeight,
-                                                     minOverlapM: consistency.minOverlapM, greenUT: consistency.greenUT, yellowUT: consistency.yellowUT),
+                                                     minOverlapM: consistency.minOverlapM, greenUT: consistency.greenUT, yellowUT: consistency.yellowUT,
+                                                     probeCm: consistency.probeCm, minContrastUT: consistency.minContrastUT),
                                    sessions: ss, segments: segs, counts: counts)
     }
 }

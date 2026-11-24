@@ -76,6 +76,37 @@ final class SurveySegmentsTests: XCTestCase {
         XCTAssertNil(SurveySegments.consistency([a, b])[1].likelyWrong)
     }
 
+    func testFlatFieldOverlapIsGrayNotGreen() {
+        // 磁场几乎平（只有很缓的坡）：两遍读数对得上，但挪 75 cm 也照样对得上，验证不了 → 灰（flat），不给绿
+        func flat(_ id: String, seed: UInt64) -> SurveySegments.Piece {
+            var g = SplitMix(seed)
+            return .init(id: id, session: id, samples: corridor.map { p in (p, 45 + 0.002 * p.x + 0.3 * g.gauss(), 30 + 0.3 * g.gauss()) }, deleted: false)
+        }
+        let r = SurveySegments.consistency([flat("a", seed: 1), flat("b", seed: 2)])
+        XCTAssertEqual(r.map(\.grade), [.gray, .gray], "\(r)")
+        XCTAssertEqual(r[0].flat, true)
+        XCTAssertNotNil(r[0].residualUT, "有重叠、有残差，只是验证不了")
+        XCTAssertEqual(r[0].verifiableM ?? -1, 0, accuracy: 0.01)
+        // 有起伏的磁场：同样两遍是绿，而且能验证的重叠就是整段
+        let ok = SurveySegments.consistency([piece("a", corridor, noise: 0.3, seed: 1), piece("b", corridor, noise: 0.3, seed: 2)])
+        XCTAssertEqual(ok.map(\.grade), [.green, .green], "\(ok)")
+        XCTAssertNil(ok[0].flat)
+        XCTAssertGreaterThan(ok[0].verifiableM ?? 0, 10)
+    }
+
+    func testSuggestionWithheldWhenBestFitIsAmbiguous() {
+        // 沿走廊 1 m 一个周期的磁场：挪 1.5 m 的那遍对不上（反相），但往回挪 0.5 m、1.5 m 都一样好 → 不给挪动建议
+        func periodic(_ id: String, shift: Double, seed: UInt64) -> SurveySegments.Piece {
+            var g = SplitMix(seed)
+            return .init(id: id, session: id, samples: corridor.map { p in
+                (Point2(p.x + shift, p.y), 45 + 6 * sin(2 * .pi * p.x / 100) + 0.2 * g.gauss(), 30 + 4 * cos(2 * .pi * p.x / 100) + 0.2 * g.gauss())
+            }, deleted: false)
+        }
+        let r = SurveySegments.consistency([periodic("a", shift: 0, seed: 1), periodic("b", shift: 150, seed: 2), periodic("c", shift: 0, seed: 3)])
+        XCTAssertTrue(r[1].grade == .red || r[1].grade == .yellow, "\(r[1])")
+        XCTAssertNil(r[1].suggestDx, "最低点不唯一，不该建议：\(r[1])")
+    }
+
     func testDeletedPieceIsNotAReference() {
         var bad = piece("b", corridor, shift: Point2(150, 0))
         bad.deleted = true

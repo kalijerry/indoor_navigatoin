@@ -222,7 +222,10 @@ function recolor(withSuggest) {
     if (r0 && r0.n * 0.25 >= th.minOverlapM) {
       // 和每段单独比；评定 = 加权下中位（至少和一半重叠的路线对得上才算绿），见 SurveySegments.consistency
       const pair = [];
-      st.segs.forEach((o, j) => { if (j === k || o.deleted) return; const r = resid(k, 0, 0, j); if (r && r.n * 0.25 >= th.minOverlapM) pair.push({ id: o.id, r: r.r, n: r.n }); });
+      // contrast：往 8 个方向各挪 probeCm，和这一段的残差（中位）涨多少；涨不到 minContrastUT = 那一带磁场太平，这对验证不了
+      const probe = th.probeCm ?? 75, minC = th.minContrastUT ?? 0.5;
+      const contrast = (j, r) => { const rs = []; for (let a = 0; a < 8; a++) { const q = resid(k, probe * Math.cos(a * Math.PI / 4), probe * Math.sin(a * Math.PI / 4), j); if (q && q.n >= r.n * 0.7) rs.push(q.r); } return rs.length >= 4 ? med(rs) - r.r : 0; };
+      st.segs.forEach((o, j) => { if (j === k || o.deleted) return; const r = resid(k, 0, 0, j); if (r && r.n * 0.25 >= th.minOverlapM) pair.push({ id: o.id, r: r.r, n: r.n, c: contrast(j, r) }); });
       let score = r0.r;
       if (pair.length) {
         const sorted = pair.slice().sort((a, b) => a.r - b.r), half = sorted.reduce((a, x) => a + x.n, 0) / 2;
@@ -230,10 +233,14 @@ function recolor(withSuggest) {
       }
       v.residualUT = Math.round(score * 100) / 100;
       v.grade = score <= th.greenUT ? "green" : score <= th.yellowUT ? "yellow" : "red";
+      // 绿要「验证过」：对得上、而且挪 probeCm 能看出来的重叠够 minOverlapM，否则灰（flat）
+      const verN = pair.filter((x) => x.r <= th.greenUT && x.c >= minC).reduce((a, x) => a + x.n, 0);
+      v.verifiableM = Math.round(verN * 2.5) / 10;
+      if (v.grade === "green" && verN * 0.25 < th.minOverlapM) { v.grade = "gray"; v.flat = true; }
       for (const x of pair.filter((x) => x.r > th.greenUT).sort((a, b) => b.r - a.r).slice(0, 5)) v.conflicts[x.id] = Math.round(x.r * 10) / 10;
       v.partners = pair.length;
       // 谁更可能错：离真值点（起点 / 长按修正）走得越远越可能漂偏（同 SurveySegments.consistency）
-      if (v.grade !== "green" && s.driftM != null) {
+      if ((v.grade === "yellow" || v.grade === "red") && s.driftM != null) {
         let me = 0, them = 0;
         for (const x of pair) {
           if (x.r <= th.greenUT) continue;
@@ -242,19 +249,25 @@ function recolor(withSuggest) {
         }
         v.likelyWrong = me > them ? true : them > me ? false : null;
       }
-      if (withSuggest === k && v.grade !== "green") {
+      if (withSuggest === k && (v.grade === "yellow" || v.grade === "red")) {
         // 不能挪出可走区域（地图有地面多边形时；同 SurveySegments.consistency）
         const inside = (dx, dy) => { if (!st.map || !st.map.floor.length) return 1; let n = 0; for (const [x, y] of P[k]) if (inFloor(x + dx, y + dy)) n++; return n / Math.max(P[k].length, 1); };
         const in0 = inside(0, 0);
-        let best = { dx: 0, dy: 0, r: r0.r, sc: r0.r };
-        for (let ix = -6; ix <= 6; ix++) for (let iy = -6; iy <= 6; iy++) {
+        let best = { dx: 0, dy: 0, r: r0.r, sc: r0.r }, outside = Infinity;
+        const tried = [];
+        // 多搜一圈（范围外一格）只用来判断真正的最低点是不是在范围外
+        for (let ix = -7; ix <= 7; ix++) for (let iy = -7; iy <= 7; iy++) {
           if (!ix && !iy) continue;
           const dx = ix * 25, dy = iy * 25, r = resid(k, dx, dy);
           if (!r || r.n < r0.n * 0.7 || inside(dx, dy) < in0 - 0.1) continue;
+          if (Math.abs(ix) > 6 || Math.abs(iy) > 6) { outside = Math.min(outside, r.r); continue; }
+          tried.push([dx, dy, r.r]);
           const sc = r.r + 0.002 * Math.hypot(dx, dy);
           if (sc < best.sc) best = { dx, dy, r: r.r, sc };
         }
-        if (best.r <= r0.r * 0.7 && best.r <= th.greenUT * 1.5 && Math.hypot(best.dx, best.dy) >= 50) { v.suggestDx = best.dx; v.suggestDy = best.dy; v.suggestResidualUT = Math.round(best.r * 100) / 100; }
+        // 最低点不明确（范围外更好，或离最优 probeCm 以外还有差不多好的位置）就不建议，同 SurveySegments.consistency
+        const ambiguous = outside < best.r || tried.some(([dx, dy, r]) => Math.hypot(dx - best.dx, dy - best.dy) > probe && r <= best.r * 1.1);
+        if (!ambiguous && best.r <= r0.r * 0.7 && best.r <= th.greenUT * 1.5 && Math.hypot(best.dx, best.dy) >= 50) { v.suggestDx = best.dx; v.suggestDy = best.dy; v.suggestResidualUT = Math.round(best.r * 100) / 100; }
       }
     }
     s.v = v;
@@ -431,7 +444,8 @@ function renderPanel() {
   const name = (id) => { const o = st.segs.find((x) => x.id === id); return o ? `${short(o.session)} 第 ${o.no} 段` : id; };
   const conf = Object.entries(s.v.conflicts || {}).sort((a, b) => b[1] - a[1]);
   $("selInfo").innerHTML = `<b>${esc(short(s.session))} 第 ${s.no} 段</b> · ${s.lengthM} m${s.manual ? " · 手动摆过" : ""}${s.deleted ? " · <span class=bad>已删</span>" : ""}<br>
-    <span style="color:${gradeCol(s.v.grade)}">●</span> ${GRADE[s.v.grade]}${s.v.residualUT != null ? `（残差 ${s.v.residualUT} µT，重叠 ${s.v.overlapM} m）` : s.v.overlapM ? `（重叠 ${s.v.overlapM} m，不够 ${st.exp.thresholds.minOverlapM} m）` : ""}
+    <span style="color:${gradeCol(s.v.grade)}">●</span> ${s.v.flat ? "灰 · 对得上，但验证不了" : GRADE[s.v.grade]}${s.v.residualUT != null ? `（残差 ${s.v.residualUT} µT，重叠 ${s.v.overlapM} m）` : s.v.overlapM ? `（重叠 ${s.v.overlapM} m，不够 ${st.exp.thresholds.minOverlapM} m）` : ""}
+    ${s.v.flat ? `<br>重叠处磁场太平：把这段挪 75 cm 读数照样对得上，所以「对得上」不能说明摆对了。在磁场有起伏的地方（门口、柱子、货架头）多走一遍交叉路线才能验证` : ""}
     ${s.v.likelyWrong === true ? `<br><b style="color:${gradeCol(s.v.grade)}">! 更可能是这段错</b>：它离起点 / 修正点走了 ${s.driftM} m，和它对不上的路线更近` : ""}
     ${s.v.likelyWrong === false ? `<br>对不上的路线离起点 / 修正点更远（这段 ${s.driftM} m），更可能是对方错，先看对方` : ""}
     ${s.v.grade === "gray" && !s.deleted ? "<br>只走过一遍，没法验证。下次采集从这段中间横穿或重叠走 3 m 以上。" : ""}

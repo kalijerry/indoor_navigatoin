@@ -213,6 +213,16 @@ public enum SurveySegments {
         public var removeSegmentOffset = true
         /// 两段离真值点的路程差至少这么多（m）才判谁更可能错
         public var tieBreakM = 5.0
+        /// 「能不能验证」：把这段往 8 个方向各挪 probeCm，和那一段的残差平均（中位）至少涨 minContrastUT 才算这对重叠
+        /// 真能看出摆错（磁场在那一带有起伏）。对得上、但挪 75 cm 也照样对得上的重叠不算验证：
+        /// 办公室实测 |B|+Bz 绿的 19 对里 15 对挪 75 cm 残差涨不到 0.5 µT，这 15 对里故意挪 1 m 只有 49% 能被标出来，
+        /// 另外 4 对是 92%（docs/route-verification-research.md）。所以「绿」要求至少 minOverlapM 的重叠是能验证的，
+        /// 否则仍是灰（flat = true：有重叠、对得上，但那一带磁场太平，验证不了）
+        public var probeCm = 75.0
+        public var minContrastUT = 0.5
+        /// 建议挪动要「唯一」：离最优位置超过 probeCm 的地方残差不能和最优差不多（≤ 最优 × ambiguity），
+        /// 最优也不能在搜索范围边上（说明真正的最低点在范围外或者根本没有明显的最低点）
+        public var ambiguity = 1.1
         public init() {}
     }
 
@@ -245,6 +255,10 @@ public enum SurveySegments {
         /// false = 对方更可能错，nil = 分不出 / 没有对不上的。只是参考，颜色仍按多数一致
         public var likelyWrong: Bool? = nil
         public var driftM: Double? = nil
+        /// true = 有重叠、读数也对得上，但重叠处磁场太平（挪 probeCm 残差也不明显变大），这次验证不了，按灰算
+        public var flat: Bool? = nil
+        /// 能验证的重叠长度（m）：和这段对得上、而且挪 probeCm 残差会明显变大的那几段的重叠
+        public var verifiableM: Double? = nil
     }
 
     /// 每段的评定（和输入一一对应；删掉的段也评，方便看删得对不对，但它不当别人的参考）
@@ -312,6 +326,19 @@ public enum SurveySegments {
             return (median(e), dt.count)
         }
         let step = 0.25   // 样本间隔约 25 cm
+        /// 段 k 和段 j 这对重叠「能不能看出摆错」：往 8 个方向各挪 probeCm，残差（中位）比不挪时涨多少（µT）。
+        /// 挪过去重叠少于原来 70% 的方向不算（躲开比较不算数）
+        func contrast(_ k: Int, _ j: Int, _ r0: (r: Double, n: Int)) -> Double {
+            var rs: [Double] = []
+            for a in 0..<8 {
+                let th = Double(a) * .pi / 4
+                guard let r = residual(k, dx: config.probeCm * cos(th), dy: config.probeCm * sin(th), only: j),
+                      Double(r.n) >= Double(r0.n) * 0.7 else { continue }
+                rs.append(r.r)
+            }
+            guard rs.count >= 4 else { return 0 }
+            return median(rs) - r0.r
+        }
         return pieces.indices.map { k in
             guard let r0 = residual(k, dx: 0, dy: 0), Double(r0.n) * step >= config.minOverlapM else {
                 let n = residual(k, dx: 0, dy: 0)?.n ?? 0
@@ -321,10 +348,10 @@ public enum SurveySegments {
             // 和每一段单独比（重叠够的）。评定用「至少和一半（按重叠长度算）对得上」：
             // 按残差从小到大，取累计重叠到一半的那个（加权下中位）。所以两条对不上时两条都红；
             // 第三条和其中一条一致时，那两条回到绿，错的那条还是红（和所有人比的平均会被错的那条拖成黄）
-            var pair: [(id: String, r: Double, n: Int)] = []
+            var pair: [(id: String, r: Double, n: Int, contrast: Double)] = []
             for j in pieces.indices where j != k && !pieces[j].deleted {
                 guard let r = residual(k, dx: 0, dy: 0, only: j), Double(r.n) * step >= config.minOverlapM else { continue }
-                pair.append((pieces[j].id, r.r, r.n))
+                pair.append((pieces[j].id, r.r, r.n, contrast(k, j, r)))
             }
             var score = r0.r
             if !pair.isEmpty {
@@ -333,34 +360,51 @@ public enum SurveySegments {
                 var acc = 0.0
                 for x in sorted { acc += Double(x.n); if acc >= half { score = x.r; break } }
             }
-            let grade: Grade = score <= config.greenUT ? .green : score <= config.yellowUT ? .yellow : .red
+            var grade: Grade = score <= config.greenUT ? .green : score <= config.yellowUT ? .yellow : .red
+            // 绿要「验证过」：对得上的那几段里，能看出摆错的重叠够 minOverlapM；不够就是灰（磁场太平）
+            let verifiableN = pair.filter { $0.r <= config.greenUT && $0.contrast >= config.minContrastUT }.reduce(0) { $0 + $1.n }
+            var flat: Bool?
+            if grade == .green && Double(verifiableN) * step < config.minOverlapM { grade = .gray; flat = true }
             var conf: [String: Double] = [:]
             for x in pair.filter({ $0.r > config.greenUT }).sorted(by: { $0.r > $1.r }).prefix(5) { conf[x.id] = (x.r * 10).rounded() / 10 }
             // 建议挪动（只在不是绿的时候找）
             var sug: (dx: Double, dy: Double, r: Double)?
-            if grade != .green {
+            if grade == .yellow || grade == .red {
                 let ns = Int((config.searchCm / config.searchStepCm).rounded())
                 var best = (dx: 0.0, dy: 0.0, r: r0.r)
+                var tried: [(dx: Double, dy: Double, r: Double)] = []
                 func inside(_ dx: Double, _ dy: Double) -> Double {
                     guard let w = walkable, !pieces[k].samples.isEmpty else { return 1 }
                     return Double(pieces[k].samples.filter { w(Point2($0.p.x + dx, $0.p.y + dy)) }.count) / Double(pieces[k].samples.count)
                 }
                 let in0 = inside(0, 0)
-                for ix in -ns...ns {
-                    for iy in -ns...ns where ix != 0 || iy != 0 {
+                // 多搜一圈（范围外一格）只用来判断「真正的最低点是不是在范围外」，不在那里给建议
+                var outside = Double.infinity
+                for ix in -(ns + 1)...(ns + 1) {
+                    for iy in -(ns + 1)...(ns + 1) where ix != 0 || iy != 0 {
                         let dx = Double(ix) * config.searchStepCm, dy = Double(iy) * config.searchStepCm
                         // 挪过去重叠要和现在差不多（不能靠挪到没人走过的地方「躲开」比较）
                         guard let r = residual(k, dx: dx, dy: dy), Double(r.n) >= Double(r0.n) * 0.7, inside(dx, dy) >= in0 - 0.1 else { continue }
+                        if abs(ix) > ns || abs(iy) > ns { outside = min(outside, r.r); continue }
+                        tried.append((dx, dy, r.r))
                         // 小一点的先验：同样好时选挪得少的
                         let sc = r.r + 0.002 * (dx * dx + dy * dy).squareRoot()
                         if sc < best.r + 0.002 * (best.dx * best.dx + best.dy * best.dy).squareRoot() { best = (dx, dy, r.r) }
                     }
                 }
-                if best.r <= r0.r * config.improve && best.r <= config.greenUT * 1.5 && (best.dx * best.dx + best.dy * best.dy).squareRoot() >= config.minSuggestCm { sug = best }
+                // 范围外还有更好的（最低点不在范围里），或者离最优 probeCm 以外还有差不多好的位置：最低点不明确，
+                // 不给建议（给了常常挪错）
+                let onEdge = outside < best.r
+                let ambiguous = tried.contains { x in
+                    let d = ((x.dx - best.dx) * (x.dx - best.dx) + (x.dy - best.dy) * (x.dy - best.dy)).squareRoot()
+                    return d > config.probeCm && x.r <= best.r * config.ambiguity
+                }
+                if !onEdge && !ambiguous && best.r <= r0.r * config.improve && best.r <= config.greenUT * 1.5
+                    && (best.dx * best.dx + best.dy * best.dy).squareRoot() >= config.minSuggestCm { sug = best }
             }
             // 谁更可能错：和对不上的各段比离真值点的路程，按重叠加权投票
             var likely: Bool?
-            if grade != .green, let dk = pieces[k].driftM {
+            if grade == .yellow || grade == .red, let dk = pieces[k].driftM {
                 var me = 0.0, them = 0.0
                 for x in pair where x.r > config.greenUT {
                     guard let j = pieces.firstIndex(where: { $0.id == x.id }), let dj = pieces[j].driftM else { continue }
@@ -370,7 +414,8 @@ public enum SurveySegments {
             }
             return Verdict(grade: grade, overlapM: (Double(r0.n) * step * 10).rounded() / 10, residualUT: (score * 100).rounded() / 100,
                            conflicts: conf, suggestDx: sug?.dx, suggestDy: sug?.dy, suggestResidualUT: sug.map { ($0.r * 100).rounded() / 100 },
-                           likelyWrong: likely, driftM: pieces[k].driftM.map { ($0 * 10).rounded() / 10 })
+                           likelyWrong: likely, driftM: pieces[k].driftM.map { ($0 * 10).rounded() / 10 },
+                           flat: flat, verifiableM: (Double(verifiableN) * step * 10).rounded() / 10)
         }
     }
 
