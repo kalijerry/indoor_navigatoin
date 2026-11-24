@@ -72,6 +72,8 @@ private final class MagPipeline {
     var pos: Point2?
     var lastShown: Point2?
     var lastHeadingRad = 0.0
+    /// 粒子后验修正后的航向（不可信时 nil）
+    var lastPostHeadingRad: Double?
 
     // 视觉里程计（ARKit）
     enum VioPending {
@@ -288,6 +290,8 @@ final class MagneticEngine: ObservableObject {
     private var navFromFind = false
     private var nav: NavigationSession?
     private var navMapKey = ""
+    /// 正在跑的定位器（可走区域 / 射线模型）对应的地图几何指纹，见 refreshGeometryIfNeeded
+    private var liveGeometryHash = ""
     /// 到达判定（NAV-002）：连续确认、定位可信、离目标直线近、不隔货架 / 墙才算到
     private var navArrival = ArrivalPolicy()
     /// 定位质量（NAV-004）：导航按它决定出不出转向、要不要重新规划、能不能判到达
@@ -830,6 +834,7 @@ final class MagneticEngine: ObservableObject {
         }
         let loc = MagneticLocalizer(field: field, walkable: walk, config: cfg)
         loc.raycaster = MagMapStore.shared.raycaster()
+        liveGeometryHash = MagMapStore.shared.geometryHash
         loc.reset(start: start, spreadCm: TrackingProfile.startSpreadCm, headingUnknown: headingUnknown, priorFraction: priorFraction)
         return loc
     }
@@ -1529,16 +1534,7 @@ final class MagneticEngine: ObservableObject {
         }
         // 规划器按地图几何指纹缓存：原来只比货架数 / 通道数，挪了货架、改了通道走向但数量不变时继续用旧规划器（NAV-001）
         let key = map.geometryHash
-        if nav == nil || key != navMapKey {
-            var cfg = RoutePlannerConfig()
-            cfg.offRouteDistanceCm = 300          // 偏离 3 m 以上
-            cfg.offRouteConfirmUpdates = 3        // 连续 3 次定位更新才重新规划
-            let planner = RoutePlanner(shelves: map.shelves, crosses: map.crosses,
-                                       walkable: MagMapStore.shared.walkableMap(), config: cfg)
-            nav = NavigationSession(planner: planner)
-            navArrival = ArrivalPolicy(lineClear: { a, b in planner.isLineClear(from: a, to: b) })
-            navMapKey = key
-        }
+        if nav == nil || key != navMapKey { rebuildNavPlanner(map: map) }
         navArrival.reset()
         targetId = nil
         hint = nil
@@ -1570,6 +1566,40 @@ final class MagneticEngine: ObservableObject {
         navigate(to: target, label: code,
                  shelf: NavInstruction.Shelf(name: String(code.dropFirst("Shelf-".count)), center: Point2(s.x, s.y)))
         navFromFind = fromFind && navLabel != nil
+    }
+
+    /// 按当前地图重建路径规划器和到达判定（到达判定的「不隔货架 / 墙」用同一个规划器的几何）
+    private func rebuildNavPlanner(map: StoreMap) {
+        var cfg = RoutePlannerConfig()
+        cfg.offRouteDistanceCm = 300          // 偏离 3 m 以上
+        cfg.offRouteConfirmUpdates = 3        // 连续 3 次定位更新才重新规划
+        let planner = RoutePlanner(shelves: map.shelves, crosses: map.crosses,
+                                   walkable: MagMapStore.shared.walkableMap(), config: cfg)
+        nav = NavigationSession(planner: planner)
+        navArrival = ArrivalPolicy(lineClear: { a, b in planner.isLineClear(from: a, to: b) })
+        navMapKey = map.geometryHash
+    }
+
+    /// 定位 / 导航进行中地图几何变了（采集页、扫描页改了地图，NAV-001）：正在跑的粒子滤波换上新的可走区域和射线模型，
+    /// 导航按新地图重新规划（目标不变），货架标识牌也按新地图重建。每次出位置前查一次（只比较缓存的指纹字符串）
+    private func refreshGeometryIfNeeded() {
+        let store = MagMapStore.shared
+        let h = store.geometryHash
+        guard !h.isEmpty, h != liveGeometryHash else { return }
+        let first = liveGeometryHash.isEmpty
+        liveGeometryHash = h
+        guard !first else { return }
+        AppLog.i("地磁", "定位中地图几何变了：粒子滤波换新的可走区域，导航按新地图重新规划")
+        let walk = store.walkableMap(), rc = store.raycaster()
+        queue.async { [pipe] in pipe.localizer?.replaceGeometry(walkable: walk, raycaster: rc) }
+        guard let map = StoreDataStore.shared.map else { return }
+        if shelfSigns != nil { shelfSigns = ShelfSigns(map: map, walkable: walk) }
+        if let old = nav, old.isActive, map.geometryHash != navMapKey {
+            let targets = old.targets
+            rebuildNavPlanner(map: map)
+            navHint = nav?.start(targets: targets, from: position)
+            navRoute = nav?.route
+        }
     }
 
     func stopNavigation() {
@@ -1858,6 +1888,8 @@ final class MagneticEngine: ObservableObject {
             pipe.shownA = pipe.vioEnabled ? pipe.latestA : nil      // AR 叠加：和显示位置同一时刻的 ARKit 位置
             pipe.lastConverged = est?.converged ?? true
             pipe.lastHeadingRad = out.headingRad
+            // 视觉里程计对齐用的航向提示：有粒子后验航向就用它（NAV-003），否则融合航向
+            pipe.lastPostHeadingRad = est?.correctedHeading(pdrHeadingRad: out.headingRad)
             emit(pipe: pipe, tMs: out.tMs, shown: shown, unc: unc, est: est, heading: out.headingRad,
                  headingDeg: out.headingDeg, src: "pdr", feature: feat)
         case .localizing:
@@ -1914,6 +1946,7 @@ final class MagneticEngine: ObservableObject {
             if let e = est, !e.converged {
                 self.stepCount = steps
                 self.estimate = e
+                self.pauseNavigationWhileUnconverged(e)
                 let next: LocState = (self.locState == .tracking || self.locState == .lost) ? .lost : .searching
                 if next != self.locState {
                     self.locState = next
@@ -1956,7 +1989,7 @@ final class MagneticEngine: ObservableObject {
         }
         guard pipe.vioPending == nil else { return }
         let out = pipe.aligner.process(ar: a, trackingNormal: state == 2,
-                                       headingHint: pipe.lastOut?.headingRad,
+                                       headingHint: pipe.lastPostHeadingRad ?? pipe.lastOut?.headingRad,
                                        currentMap: pipe.lastShown ?? pipe.pos)
         switch out {
         case .unaligned(let progress):
@@ -2054,6 +2087,7 @@ final class MagneticEngine: ObservableObject {
     private func applyFix(position p: Point2, uncertainty: Double, heading: Double, steps: Int,
                           feature f: MagneticFeature?, estimate est: MagneticEstimate?) {
         guard phase == .localizing || (phase == .live && isTracking) else { return }
+        refreshGeometryIfNeeded()
         estimate = est
         uncertaintyCm = uncertainty
         // 航向：有粒子滤波时用后验修正过的航向（粒子各自的航向偏差，主簇加权圆周均值，NAV-003）；
@@ -2110,6 +2144,26 @@ final class MagneticEngine: ObservableObject {
                 navHint = nil
                 navArrived = true
             }
+        }
+    }
+
+    /// 粒子滤波没把握（搜索中 / 丢了）：位置不更新，但导航不能继续显示上一次的转向提示——
+    /// 按 searching / lost 送进导航，播报变成「正在确认位置」，到达判定清零（NAV-004）
+    private func pauseNavigationWhileUnconverged(_ e: MagneticEstimate) {
+        let tMs = Int64((Date().timeIntervalSince1970 * 1000).rounded())
+        let q = fixClassifier.classify(position: e.position, timestampMs: tMs, uncertaintyCm: e.uncertaintyCm, converged: false)
+        if fixQuality != q {
+            AppLog.i("地磁", "定位质量 \(fixQuality.rawValue) → \(q.rawValue)：导航暂停转向提示")
+            fixQuality = q
+        }
+        headingUncertain = true
+        navArrival.reset()
+        guard let n = nav, n.isActive else { return }
+        let fix = LocalizationFix(position: position ?? e.position, timestampMs: tMs, uncertaintyCm: e.uncertaintyCm,
+                                  confidence: e.confidence, roomId: e.roomId, quality: q, source: .magnetic)
+        if let h = n.onFix(fix) {
+            navHint = h
+            navRoute = h.route
         }
     }
 

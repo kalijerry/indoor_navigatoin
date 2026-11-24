@@ -411,8 +411,8 @@ struct MagRNG {
 public final class MagneticLocalizer {
     public var config: MagneticConfig
     public let field: MagneticFieldMap
-    /// 可走区域。nil 表示整张地图都能走（10×10 m 测试区）。
-    public let walkable: WalkableMap?
+    /// 可走区域。nil 表示整张地图都能走（10×10 m 测试区）。定位中途地图几何变了用 `replaceGeometry` 换
+    public private(set) var walkable: WalkableMap?
     /// 货架射线投射，用于横向距离观测。
     public var raycaster: ShelfRaycaster?
 
@@ -623,15 +623,43 @@ public final class MagneticLocalizer {
         self.config = config
         self.rng = MagRNG(seed: seed)
         challengerSeed = seed &* 0xD1B5_4A32_D192_ED03 &+ 1
+        mappedCells = Self.mappedCells(field: field, walkable: walkable)
+        reset(start: nil)
+    }
+
+    private static func mappedCells(field: MagneticFieldMap, walkable: WalkableMap?) -> [Point2] {
+        var out: [Point2] = []
         for j in 0..<field.rows {
             for i in 0..<field.cols {
                 let c = Point2((Double(i) + 0.5) * field.cellCm, (Double(j) + 0.5) * field.cellCm)
                 guard field.sample(at: c) != nil else { continue }
                 if let w = walkable, !w.isWalkable(c) { continue }
-                mappedCells.append(c)
+                out.append(c)
             }
         }
-        reset(start: nil)
+        return out
+    }
+
+    /// 定位中途地图几何变了（挪了货架 / 墙 / 门、改了通道，NAV-001）：换成新的可走区域和射线模型，不重新开始。
+    /// 冷启动撒粒子的范围按新可走区域重算；落进新障碍物里的粒子挪到 2 m 内最近的可走处，挪不了的大幅降权。
+    /// 后台挑战者一起换。
+    public func replaceGeometry(walkable w: WalkableMap?, raycaster rc: ShelfRaycaster?) {
+        walkable = w
+        raycaster = rc
+        mappedCells = Self.mappedCells(field: field, walkable: w)
+        if let w {
+            for i in xs.indices {
+                let p = Point2(xs[i], ys[i])
+                guard !w.isWalkable(p) else { continue }
+                if let q = w.nearestWalkable(to: p, radiusCm: 200) {
+                    xs[i] = q.x; ys[i] = q.y
+                } else {
+                    logw[i] -= 20
+                }
+            }
+            normalize()
+        }
+        challenger?.replaceGeometry(walkable: w, raycaster: rc)
     }
 
     /// 有磁场数据的面积（m²），冷启动只在这里面找。

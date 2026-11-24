@@ -74,6 +74,46 @@ final class NavCorrectnessTests: XCTestCase {
         XCTAssertEqual(rb.targetPoints.first!.y, 500, accuracy: 1)
     }
 
+    /// 定位进行中地图改了（走廊尽头新加了一面墙）：粒子滤波换上新可走区域，之后不能再穿过去；
+    /// 原来定位器在开始时拿走可走区域，一直用旧的
+    func testRunningLocalizerPicksUpNewGeometry() {
+        let field = Self.emptyField(w: 3000, h: 400)
+        let open = WalkableMap(crosses: [CrossSegment(code: "C", a: Point2(0, 200), b: Point2(3000, 200), lineWidth: 300)],
+                               widthCm: 3000, heightCm: 400)
+        // 新地图：走廊只到 x = 1200
+        let short = WalkableMap(crosses: [CrossSegment(code: "C", a: Point2(0, 200), b: Point2(1200, 200), lineWidth: 300)],
+                                widthCm: 3000, heightCm: 400)
+        var cfg = MagneticConfig()
+        cfg.initialHeadingBiasSigmaDeg = 0; cfg.headingBiasWalkDegPerM = 0; cfg.initialScaleSigma = 0; cfg.scaleWalkPerM = 0
+        func run(replace: Bool) -> MagneticEstimate {
+            let loc = MagneticLocalizer(field: field, walkable: open, config: cfg, seed: 4)
+            loc.reset(start: Point2(400, 200), spreadCm: 30)
+            for _ in 0..<10 { loc.step(delta: Point2(50, 0), feature: nil) }      // 走到 x ≈ 900
+            if replace { loc.replaceGeometry(walkable: short, raycaster: nil) }
+            var e = loc.estimate()
+            for _ in 0..<20 { e = loc.step(delta: Point2(50, 0), feature: nil) }  // 再往前 10 m
+            return e
+        }
+        XCTAssertGreaterThan(run(replace: false).position.x, 1500, "复现：旧可走区域，穿过新墙")
+        let e = run(replace: true)
+        XCTAssertLessThanOrEqual(e.position.x, 1400, "新墙挡住（走廊端头 1200 + 半宽 150 + 一格）")
+        XCTAssertTrue(short.isWalkable(e.position))
+    }
+
+    /// 换几何时落进新障碍物的粒子挪到最近的可走处
+    func testReplaceGeometryMovesParticlesOutOfNewObstacles() {
+        let field = Self.emptyField(w: 3000, h: 400)
+        let open = WalkableMap(crosses: [CrossSegment(code: "C", a: Point2(0, 200), b: Point2(3000, 200), lineWidth: 300)],
+                               widthCm: 3000, heightCm: 400)
+        let short = WalkableMap(crosses: [CrossSegment(code: "C", a: Point2(0, 200), b: Point2(1200, 200), lineWidth: 300)],
+                                widthCm: 3000, heightCm: 400)
+        let loc = MagneticLocalizer(field: field, walkable: open, config: MagneticConfig(), seed: 4)
+        loc.reset(start: Point2(1280, 200), spreadCm: 30)
+        loc.replaceGeometry(walkable: short, raycaster: nil)
+        XCTAssertTrue(short.isWalkable(loc.estimate().position))
+        XCTAssertEqual(loc.walkable?.walkableCellCount, short.walkableCellCount)
+    }
+
     // MARK: - NAV-002 到达判定
 
     /// 两条平行通道 y = 100 / y = 300，中间一排货架（y 170～230，x 150～650），右端 x = 800 纵向通道连通
