@@ -67,6 +67,30 @@ final class SessionRegistrationTests: XCTestCase {
         XCTAssertLessThan(misalignment(s[0], r[0], s[1], r[1]), before / 3, "\(r)")
     }
 
+    /// 路上定过位置的遍不挪（只当参考）；别的遍照样对齐到它
+    func testMultiplyAnchoredPassStaysPut() {
+        var s = [session("a", shift: .zero, rotDeg: 0),
+                 session("b", shift: Point2(-60, 40), rotDeg: 2, offsetUT: 3)]
+        s[0].fixed = true
+        let r = SessionRegistration(widthCm: 1200, heightCm: 2000, walkable: nil).solve(s)
+        XCTAssertTrue(r[0].isIdentity, "\(r[0])")
+        XCTAssertLessThan(misalignment(s[0], r[0], s[1], r[1]), 30, "\(r[1])")
+        // 只有路上定过位置的遍：一个都不挪
+        var t = s
+        t[1].fixed = true
+        XCTAssertTrue(SessionRegistration(widthCm: 1200, heightCm: 2000, walkable: nil).solve(t).allSatisfy(\.isIdentity))
+    }
+
+    func testMultiplyAnchoredDetection() {
+        func a(_ kind: String, _ x: Double) -> SurveySession.Anchor {
+            .init(tMs: 0, kind: kind, map: Point2(x, 100), ar: .zero, heading: nil)
+        }
+        XCTAssertFalse(SessionRegistration.Session.isMultiplyAnchored([a("align", 0), a("start", 100), a("heading", 400)]))
+        XCTAssertFalse(SessionRegistration.Session.isMultiplyAnchored([a("start", 100), a("reanchor", 120)]))   // 原地再点一次
+        XCTAssertTrue(SessionRegistration.Session.isMultiplyAnchored([a("start", 100), a("reanchor", 900)]))
+        XCTAssertFalse(SessionRegistration.Session.isMultiplyAnchored([]))
+    }
+
     /// 和别的遍没有重叠时只按可走区域：穿墙的轨迹被拉回地板上
     func testPullsLonePassBackOntoFloor() {
         let floor = [[Point2(250, 150), Point2(950, 150), Point2(950, 1850), Point2(250, 1850)]]

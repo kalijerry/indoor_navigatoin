@@ -52,17 +52,26 @@ public final class MultiSessionFusion {
     /// - rigid: 每个会话的多遍互相对齐修正（SessionRegistration；nil = 不修正），对齐好之后整体套上
     public func fuse(_ sessions: [SurveySession], filters: [((Int64) -> Bool)?]? = nil,
                      corrections: [((Int64) -> Point2)?]? = nil,
-                     rigid: [SessionRegistration.Rigid?]? = nil) -> Result {
+                     rigid: [SessionRegistration.Rigid?]? = nil,
+                     edits: [SurveySegments.SessionEdits?]? = nil) -> Result {
         // 1. 每个会话：对齐、算样本、单独统计
         var prepared: [(rep: SurveySessionReport, samples: [(Point2, MagneticFeature)], snap: MagneticFieldBuilder.Snapshot)] = []
         for (si, s) in sessions.enumerated() {
             let b = SurveyMapBuilder(widthCm: map.width, heightCm: map.height, crosses: map.crosses, cellCm: cellCm)
             if let fs = filters, si < fs.count { b.sampleFilter = fs[si] }
             if let cs = corrections, si < cs.count { b.correction = cs[si] }
+            // 手动分段修改（看板上拖过 / 删过的段）：删掉的段不用；摆过的段按手动位置，不再套自动对齐
+            let ed: SurveySegments.SessionEdits? = edits.flatMap { si < $0.count ? $0[si] : nil }
+            if let ed {
+                let prev = b.sampleFilter
+                b.sampleFilter = { t in !ed.deleted(t) && (prev?(t) ?? true) }
+            }
             var (rep, samples) = b.prepare(s)
-            if let rs = rigid, si < rs.count, let r = rs[si], !r.isIdentity {
-                samples = samples.map { (r.apply($0.0), $0.1) }
-                rep.track = rep.track.map { ($0.tMs, r.apply($0.p)) }
+            let r: SessionRegistration.Rigid? = rigid.flatMap { si < $0.count ? $0[si] : nil }.flatMap { $0.isIdentity ? nil : $0 }
+            if r != nil || ed != nil {
+                func place(_ p: Point2, _ t: Int64) -> Point2 { ed?.pinned(t)?.apply(p) ?? r?.apply(p) ?? p }
+                samples = zip(rep.sampleTimes, samples).map { (place($1.0, $0), $1.1) }
+                rep.track = rep.track.filter { !(ed?.deleted($0.tMs) ?? false) }.map { ($0.tMs, place($0.p, $0.tMs)) }
             }
             let own = MagneticFieldBuilder(widthCm: map.width, heightCm: map.height, cellCm: cellCm)
             for (p, f) in samples { _ = own.add(position: p, feature: f) }

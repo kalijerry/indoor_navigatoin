@@ -8,6 +8,7 @@ import HPASSKit
 //               --id 地图编号 --name 名字 [--kind store|room] [--bearing 316]
 //               [--tag-locations 标签位置表.csv（也打进包里）] --out 包.hpmp --report 报告.json [--runs 3]
 //               [--worldmap 视觉特征地图文件（房间；打进包里，≤15 MB，>8 MB 报告里警告）]
+//               [--edits 手动分段修改.json（看板「路线」页存的，见 SurveySegments.EditSet）] [--segments-out 分段导出.json（给看板画、着色）]
 //               [--live 实时定位记录目录1,目录2,…]  地图自愈：普通定位记录里可信的路段低权重并进磁场图（见 LiveRunLoader / LiveFieldMerger）
 
 func arg(_ name: String) -> String? {
@@ -46,6 +47,10 @@ struct Report: Encodable {
     var live: LiveFieldMerger.Report?
     /// 多遍互相对齐：每遍挪了多少、转了多少（会话名 → 修正）
     var registration: [String: SessionRegistration.Rigid]?
+    /// 路线分段着色统计（green / yellow / red / gray / deleted → 段数）
+    var segments: [String: Int]?
+    /// 手动分段修改的条数（看板「路线」页；云端按它判断要不要重建）
+    var segmentEdits: Int?
 }
 
 guard let mapPath = arg("--map"), let out = arg("--out"), let id = arg("--id") else {
@@ -82,14 +87,42 @@ do {
     let shelfSigns = ShelfSigns(map: map, walkable: SessionEvaluator.walkable(map))
 
     // 磁场建图流水线（三遍融合 + 标签锚定修正 + 质量筛选 + 只用主体分量）：和评估共用 MultiSessionFusion.buildProduction
+    // 看板上手动拖过 / 删过的段
+    var editSet: SurveySegments.EditSet?
+    if let p = arg("--edits"), let d = try? Data(contentsOf: URL(fileURLWithPath: p)) {
+        do { editSet = try SurveySegments.EditSet.load(d) } catch { print("⚠️ 手动分段修改读不出来：\(error)") }
+    }
+    var sessionEdits: [String: SurveySegments.SessionEdits] = [:]
+    for s in sessions { if let e = editSet?.session(s.name) { sessionEdits[s.name] = e } }
+    if let es = editSet, !es.edits.isEmpty {
+        print("手动分段修改：\(es.edits.filter { !$0.isDeleted }.count) 段摆过、\(es.edits.filter(\.isDeleted).count) 段删掉（涉及 \(sessionEdits.count) 遍）")
+    }
+    /// 分段导出 + 一致性着色（看板「路线」页）：全部没过质量筛选也导出，用户才能在看板上看到哪段不对、改了再建
+    func exportSegments(rigid: [SessionRegistration.Rigid?], autoRigid: [SessionRegistration.Rigid?]? = nil, segmentAuto: [String: [SurveySegments.Edit]] = [:], quality: [SessionQualityGate.Report]) throws -> [String: Int]? {
+        guard let so = arg("--segments-out") else { return nil }
+        let ex = SurveySegmentExport.build(mapId: id, fusion: fusion, sessions: sessions, rigid: rigid, autoRigid: autoRigid, segmentAuto: segmentAuto, quality: quality, edits: editSet, walkable: SessionEvaluator.walkable(map))
+        let enc = JSONEncoder(); enc.outputFormatting = [.sortedKeys]
+        try enc.encode(ex).write(to: URL(fileURLWithPath: so))
+        print("路线分段：\(ex.segments.count) 段，" + ["green": "绿", "yellow": "黄", "red": "红", "gray": "灰（没和别的路线重叠）", "deleted": "已删"]
+            .compactMap { k, v in ex.counts[k].map { "\(v) \($0)" } }.sorted().joined(separator: "、"))
+        for sg in ex.segments where !sg.deleted && (sg.verdict.grade == .red || sg.verdict.grade == .yellow) {
+            print(String(format: "  %@ %@：%.0f m，重叠 %.0f m，残差 %.1f µT", sg.verdict.grade == .red ? "🔴" : "🟡", sg.id, sg.lengthM, sg.verdict.overlapM, sg.verdict.residualUT ?? 0)
+                  + (sg.verdict.suggestDx.map { String(format: "，建议挪 %+.0f, %+.0f cm（→ %.1f µT）", $0, sg.verdict.suggestDy ?? 0, sg.verdict.suggestResidualUT ?? 0) } ?? ""))
+        }
+        return ex.counts
+    }
+    var rejectedReports: [SessionQualityGate.Report] = []
     guard let pb = fusion.buildProduction(sessions, ble: bleSamples, signs: signSamples, tagPositions: tagPos,
+                                          edits: sessionEdits,
                                           onAllRejected: { reports in
+        rejectedReports = reports
         for q in reports {
             let ble = q.bleMedianM.map { String(format: "标签 %.1f m（最差 %.1f）", $0, q.bleWorstM ?? 0) } ?? "标签 -"
             let mag = q.magResidualUT.map { String(format: "磁场残差 %.1f µT（最差 %.1f）", $0, q.magWorstUT ?? 0) } ?? "磁场 -"
             print("❌ \(q.name)：不用 —— \(q.reason ?? "")（\(ble)，\(mag)，\(q.windows) 段里 \(q.bad) 段不合格）")
         }
     }) else {
+        _ = try? exportSegments(rigid: [], quality: rejectedReports)
         print("没有合格的会话，不出图"); exit(3)
     }
     if pb.signObservations > 0 { print("货架标签：\(pb.signObservations) 次") }
@@ -98,14 +131,24 @@ do {
         print(String(format: "蓝牙标签 / 货架标签修正 %@：蓝牙标签读数 %d、货架标签 %d，人−蓝牙标签中位 %.1f → %.1f m，最大挪动 %.1f m",
                      s.name, st.readings, st.signs ?? 0, st.beforeMedianM, st.afterMedianM, st.maxShiftM))
     }
+    if map.crosses.isEmpty {
+        let pinned = sessions.filter { SessionRegistration.Session.isMultiplyAnchored($0.anchors) }.map(\.name)
+        if !pinned.isEmpty { print("多遍对齐：\(pinned.count) 遍路上定过位置（起点之外还有锚点），不挪，只当参考") }
+    }
     for s in sessions {
         guard let g = pb.registration[s.name] else { continue }
-        let res = g.residualBefore.map { b in String(format: "，磁场残差 %.1f → %.1f µT", b, g.residualAfter ?? b) } ?? "，和别的遍重叠不够（只按可走区域）"
+        let res: String
+        switch (g.residualBefore, g.residualAfter) {
+        case let (b?, a?): res = String(format: "，磁场残差 %.1f → %.1f µT", b, a)
+        case let (nil, a?): res = String(format: "，原来和别的遍重叠不够、对齐后重叠上了（残差 %.1f µT）", a)
+        default: res = "，和别的遍重叠不够（只按可走区域）"
+        }
         print(String(format: "多遍对齐 %@：挪 %+.0f, %+.0f cm、转 %+.0f°%@，在可走区域里 %.0f%% → %.0f%%",
                      s.name, g.dx, g.dy, g.rotDeg, res, g.insideBefore * 100, g.insideAfter * 100))
     }
     let quality = pb.quality
     let corrStats = pb.corrections
+    let segmentCounts = try exportSegments(rigid: pb.rigid, autoRigid: pb.autoRigid, segmentAuto: pb.segmentAuto, quality: pb.quality)
     for q in quality {
         let ble = q.bleMedianM.map { String(format: "标签 %.1f m（最差 %.1f）", $0, q.bleWorstM ?? 0) } ?? "标签 -"
         let mag = q.magResidualUT.map { String(format: "磁场残差 %.1f µT（最差 %.1f）", $0, q.magWorstUT ?? 0) } ?? "磁场 -"
@@ -285,7 +328,8 @@ do {
                          walkableM2: walkableM2, unfinishedCorridors: unfinished, tests: tests, packageBytes: pkg.count, warnings: warnings,
                          tagMismatches: tagMismatches, quality: quality, corrections: corrStats,
                          zones: zoneStatus, nextZone: nextZone, nextZoneEntry: nextEntry, magExcluded: magExcluded, live: liveReport,
-                         registration: pb.registration.isEmpty ? nil : pb.registration)
+                         registration: pb.registration.isEmpty ? nil : pb.registration,
+                         segments: segmentCounts, segmentEdits: editSet?.edits.count)
         let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         try enc.encode(rep).write(to: URL(fileURLWithPath: rp))
     }

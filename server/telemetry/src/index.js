@@ -6,6 +6,9 @@
 // - GET  /api/sessions           会话列表；GET /api/sessions/<名字>.zip 下载
 // - PUT  /api/maps/<id>          上传地图 JSON（看板画地图用）；GET /api/maps/<id>
 // - PUT  /api/reports/<名字>.json 上传评估报告（hpass-eval 的 --json）；GET /api/reports 列表
+// - GET  /routes                 建图路线分段编辑页（拖动 / 旋转 / 删除每段，按磁场一致性着色）
+// - GET|PUT /api/segments/<地图>  云端建图导出的路线分段（cloud_build.py 传）
+// - GET|PUT /api/config/segments/<地图>  看板上手动改过的段（cloud_build.py 读，传给 hpass-build --edits）
 // - GET  /api/logs?day=YYYY-MM-DD 某天的日志分块列表；GET /api/logs/<key> 取一块
 // - PUT  /api/builds/<名字>.ipa   CI 上传签名（Ad Hoc）安装包，未签名的拒收；GET /api/builds 列表（只列签名包）；GET /api/builds/<名字> 下载
 // - GET  /ota/<签名>/<名字>.plist|.ipa  签名的 Ad Hoc 包给 iPhone 直接安装（itms-services 不能带口令，用 HMAC 签名的
@@ -15,6 +18,7 @@
 
 import { Hub } from "./hub.js";
 import DASHBOARD from "./dashboard.html";
+import ROUTES from "./routes.html";
 
 export { Hub };
 
@@ -79,6 +83,9 @@ export default {
 
     if (path === "/" || path === "/index.html") {
       return new Response(DASHBOARD, { headers: { "content-type": "text/html; charset=utf-8" } });
+    }
+    if (path === "/routes" || path === "/routes.html") {
+      return new Response(ROUTES, { headers: { "content-type": "text/html; charset=utf-8" } });
     }
     // 签名的 Ad Hoc 包：iPhone 点「安装」时系统去取 manifest 和 ipa，不能带口令
     let om = path.match(/^\/ota\/([0-9a-f]{32})\/([^/]+)\.(plist|ipa)$/);
@@ -300,6 +307,42 @@ export default {
       }
       const o = await env.DATA.get("config/exclude.json");
       return new Response(o ? o.body : "[]", { headers: { "content-type": "application/json; charset=utf-8" } });
+    }
+
+    // 路线分段（云端建图导出）
+    m = path.match(/^\/api\/segments\/([^/]+)$/);
+    if (m) {
+      const id = decodeURIComponent(m[1]);
+      if (!safeName(id)) return json({ error: "名字不合法" }, 400);
+      const key = "segments/" + id + ".json";
+      if (request.method === "PUT") {
+        await env.DATA.put(key, request.body, { httpMetadata: { contentType: "application/json" } });
+        return json({ ok: true });
+      }
+      const o = await env.DATA.get(key);
+      if (!o) return json({ error: "这张地图还没有分段数据（重建一次地图就有）" }, 404);
+      return new Response(o.body, { headers: { "content-type": "application/json; charset=utf-8" } });
+    }
+    // 手动改过的段：{"version":1,"mapId":…,"edits":[{session,t0Ms,t1Ms,dx,dy,rotDeg,pivotX,pivotY,deleted}]}
+    m = path.match(/^\/api\/config\/segments\/([^/]+)$/);
+    if (m) {
+      const id = decodeURIComponent(m[1]);
+      if (!safeName(id)) return json({ error: "名字不合法" }, 400);
+      const key = "config/segments/" + id + ".json";
+      if (request.method === "PUT") {
+        let b;
+        try { b = await request.json(); } catch (_) { return json({ error: "要 JSON" }, 400); }
+        const num = (x) => typeof x === "number" && Number.isFinite(x);
+        const ok = b && Array.isArray(b.edits) && b.edits.length <= 5000 && b.edits.every((e) => e && typeof e.session === "string" && safeName(e.session)
+          && num(e.t0Ms) && num(e.t1Ms) && ["dx", "dy", "rotDeg", "pivotX", "pivotY"].every((k) => e[k] === undefined || num(e[k]))
+          && (e.deleted === undefined || typeof e.deleted === "boolean"));
+        if (!ok) return json({ error: "格式不对：要 {edits:[{session,t0Ms,t1Ms,dx,dy,rotDeg,pivotX,pivotY,deleted}]}" }, 400);
+        const out = { version: 1, mapId: id, savedMs: Date.now(), edits: b.edits };
+        await env.DATA.put(key, JSON.stringify(out), { httpMetadata: { contentType: "application/json" } });
+        return json({ ok: true, count: b.edits.length });
+      }
+      const o = await env.DATA.get(key);
+      return new Response(o ? o.body : JSON.stringify({ version: 1, mapId: id, edits: [] }), { headers: { "content-type": "application/json; charset=utf-8" } });
     }
 
     // 评估报告

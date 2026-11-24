@@ -265,6 +265,11 @@ struct MappingView: View {
                     Toggle("质量太差时自动停止采集", isOn: $survey.qualityAutoStop)
                     Toggle("激光雷达实景扫描（文件较大）", isOn: $survey.scanMesh)
                         .disabled(!ARKitLogger.supportsMesh)
+                    Toggle("精度实验：过点打卡（长按 = 打卡，不修正位置）", isOn: $survey.checkpointMode)
+                    if survey.checkpointMode {
+                        Text("地上每隔约 3 m 贴一张胶带并在地图上记好位置。起点照常长按；之后每走到一张胶带，长按地图上那个点打卡。途中不要修正，来回各走 3 遍。")
+                            .font(.footnote).foregroundStyle(DS.Palette.textSecondary)
+                    }
                     if store.field != nil {
                         Toggle("测试走一圈（只测精度，不参与建图）", isOn: $survey.isTestSession)
                             .onChange(of: survey.isTestSession) { on in if on { survey.evaluate = true } }
@@ -340,7 +345,7 @@ struct MappingView: View {
                          accessibilitySummary: survey.position == nil ? "还没有定起点" : "采集中，已覆盖 \(Int(paintFraction * 100))%")
     }
 
-    /// 长按：我在这里（修正位置）
+    /// 长按：我在这里（修正位置；打卡模式下只记打卡，不修正）
     private var anchorAction: ((Point2) -> Void)? {
         guard survey.isRunning, !survey.headingEditing else { return nil }
         return { p in
@@ -353,6 +358,10 @@ struct MappingView: View {
         VStack(alignment: .leading, spacing: DS.Spacing.s) {
             if survey.speedMS > SurveyEngine.maxSpeedMS {
                 StatusPill(text: "走太快了，放慢一点", systemImage: "tortoise.fill", tone: .warning)
+            }
+            if survey.checkpointMode {
+                StatusPill(text: "打卡模式：走到胶带处长按地图上那个点（已打 \(survey.checkpointCount) 个）",
+                           systemImage: "mappin.and.ellipse", tone: .info)
             }
             if survey.needsAnchor {
                 StatusPill(text: "走了 \(Int(survey.walkedSinceAnchorM)) m 没修正：到墙角 / 门口时长按地图上你的位置",
