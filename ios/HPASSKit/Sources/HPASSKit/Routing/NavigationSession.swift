@@ -72,6 +72,32 @@ public final class NavigationSession {
         return planner.hint(for: p, on: r)
     }
 
+    /// 收到带质量的定位（NAV-004）。按 `FixQuality` 决定行为：
+    /// - reliable：同 `onLocation`（正常逐段、脱线确认后重新规划）；
+    /// - degraded：沿用当前路线出播报（含转向），但不累计脱线、不重新规划——跳点 / 不确定度偏大时别来回换路；
+    /// - coarse：只在当前路线上算剩余距离，不出转向、不重新规划；
+    /// - searching / lost：暂停，不出转向、不重新规划（还没有路线时也不规划）。
+    /// 路线还没规划（start 时没有位置）且质量不是 reliable：不规划，返回 nil。
+    @discardableResult
+    public func onFix(_ fix: LocalizationFix) -> NavHint? {
+        guard isActive else { return nil }
+        let p = fix.position
+        guard p.x.isFinite, p.y.isFinite else { return nil }
+        if fix.quality == .reliable {
+            guard var h = onLocation(p) else { return nil }
+            h.quality = .reliable
+            return h
+        }
+        guard let cur = route else { return nil }
+        lastLocation = p
+        var h = planner.hint(for: p, on: cur)
+        h.quality = fix.quality
+        if !fix.quality.allowsTurnInstructions { h.direction = .straight }
+        // 不确定的位置不触发「偏离路线」：脱线计数也不往上加
+        h.isOffRoute = false
+        return h
+    }
+
     /// 结束导航并清空状态。
     public func stop() {
         targets = []

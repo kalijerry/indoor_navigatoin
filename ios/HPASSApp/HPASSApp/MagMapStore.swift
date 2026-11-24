@@ -48,7 +48,9 @@ final class MagMapStore: ObservableObject {
     private var walkableCache: WalkableMap?
     /// 有房间单元（map.json 的 units / floorPolygons + 门 / 墙）的地图：可走区域带房间图（不经门不能换房间、房间级输出、静止冻结）
     private var roomMap: StoreMap?
-    private var roomSignature = ""
+    /// 当前采用的场地地图的几何指纹（`StoreMap.geometryHash`）。可走区域 / 房间图 / 射线模型的缓存以它为键；
+    /// 导航规划器也用它判断要不要重建（MagneticEngine.navigate）。空 = 还没采用过地图
+    private(set) var geometryHash = ""
     private var shelves: [ShelfRect] = []
     /// 房间扫描的地图：能走的地面（没有通道时用它当可走区域）
     @Published private(set) var floor: [[Point2]] = []
@@ -81,24 +83,22 @@ final class MagMapStore: ObservableObject {
     func adopt(map: StoreMap?) {
         guard let m = map, m.width > 0, m.height > 0 else { return }
         let sameSize = abs(m.width - widthCm) < 1 && abs(m.height - heightCm) < 1
-        let sameCrosses = m.crosses.count == crosses.count && m.floor == floor
+        // 几何指纹按实际坐标算（货架 / 通道 / 门 / 墙 / 房间多边形 / 原点平移 / AR 变换）：
+        // 原来按通道条数、单元 id、门墙个数判断，挪了门、墙、货架或改了通道走向但数量不变时缓存不失效（NAV-001）
+        let geo = m.geometryHash
+        let geometryChanged = geo != geometryHash
+        geometryHash = geo
         crosses = m.crosses
         floor = m.floor
-        if !sameCrosses { walkableCache = nil }
         let units = m.roomUnits.filter { $0.isWalkable && $0.polygon.count >= 3 }
-        let sig = "\(units.map(\.id).joined(separator: ","))|\(m.doors.count)|\(m.walls.count)|\(m.width)x\(m.height)"
-        if sig != roomSignature {
-            roomSignature = sig
-            roomMap = units.isEmpty ? nil : m
-            walkableCache = nil
-        }
+        roomMap = units.isEmpty ? nil : m
         // 只有标准货架（Shelf-001…100）是实物；虚拟货架和 107 / 401 / Shelf-4-… 等不参与
-        let phys = m.physicalShelves
-        if phys != shelves {
-            raycasterCache = nil   // 货架数量变了或者整体偏移改了
-            if !floor.isEmpty { walkableCache = nil }   // 房间：家具挡住的地方不能走
+        shelves = m.physicalShelves
+        if geometryChanged {
+            walkableCache = nil
+            raycasterCache = nil
+            AppLog.i("地磁", "地图几何变了（\(geo)）：可走区域 / 房间图 / 障碍物射线模型重建")
         }
-        shelves = phys
         if sameSize { return }
         widthCm = m.width
         heightCm = m.height
@@ -151,6 +151,8 @@ final class MagMapStore: ObservableObject {
         crosses = []
         floor = []
         shelves = []
+        roomMap = nil
+        geometryHash = ""
         walkableCache = nil
         raycasterCache = nil
         builder = MagneticFieldBuilder(widthCm: widthCm, heightCm: heightCm)

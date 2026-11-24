@@ -336,6 +336,29 @@ public struct MagneticEstimate {
     public var roomRunnerUpMass: Double = 0
     /// 最重粒子簇的簇内散布（cm，收敛 / 丢失判定用的那个数；nil = 和 uncertaintyCm 相同）
     public var clusterUncertaintyCm: Double? = nil
+    /// 主簇（`clusterRadiusCm` 以内）粒子航向偏差的加权圆周均值（rad，(−π, π]，NAV-003）。
+    /// 粒子推算方向 = 计步位移按 `bias` 逆时针旋转（见 predict）；没有粒子时 nil
+    public var headingBiasRad: Double? = nil
+    /// 主簇航向偏差的圆周标准差 √(−2 ln R)（rad）
+    public var headingBiasSigmaRad: Double? = nil
+    /// 主簇里航向偏差有两个以上相隔 ≥ 90° 的峰（第二峰权重 ≥ 20%）：航向有多个假设，不该给精确箭头
+    public var headingMultimodal: Bool = false
+
+    /// 航向不确定度超过它就不出修正后的航向（rad）
+    public static let maxHeadingSigmaRad: Double = 30 * Double.pi / 180
+
+    /// 计步航向（`FusionTypes` 约定：0 = 地图 +y，dx = L·sinθ、dy = L·cosθ）按粒子后验修正后的航向。
+    ///
+    /// 粒子把计步位移 (L·sinθ, L·cosθ) 按 bias 做标准旋转 (x·cos b − y·sin b, x·sin b + y·cos b)，
+    /// 结果 = (L·sin(θ − b), L·cos(θ − b))：所以修正后的航向是 **θ − b**，不是 θ + b。
+    /// 航向偏差散布 > `maxHeadingSigmaRad` 或多峰时返回 nil（不给假的精确箭头）。
+    public func correctedHeading(pdrHeadingRad: Double) -> Double? {
+        guard let b = headingBiasRad, let sd = headingBiasSigmaRad, pdrHeadingRad.isFinite,
+              sd <= Self.maxHeadingSigmaRad, !headingMultimodal else { return nil }
+        var h = (pdrHeadingRad - b).truncatingRemainder(dividingBy: 2 * Double.pi)
+        if h < 0 { h += 2 * Double.pi }
+        return h
+    }
 }
 
 /// 报的不确定度的误差模型（`MagneticConfig.honestUncertainty`）。
@@ -388,8 +411,8 @@ struct MagRNG {
 public final class MagneticLocalizer {
     public var config: MagneticConfig
     public let field: MagneticFieldMap
-    /// 可走区域。nil 表示整张地图都能走（10×10 m 测试区）。
-    public let walkable: WalkableMap?
+    /// 可走区域。nil 表示整张地图都能走（10×10 m 测试区）。定位中途地图几何变了用 `replaceGeometry` 换
+    public private(set) var walkable: WalkableMap?
     /// 货架射线投射，用于横向距离观测。
     public var raycaster: ShelfRaycaster?
 
@@ -600,15 +623,43 @@ public final class MagneticLocalizer {
         self.config = config
         self.rng = MagRNG(seed: seed)
         challengerSeed = seed &* 0xD1B5_4A32_D192_ED03 &+ 1
+        mappedCells = Self.mappedCells(field: field, walkable: walkable)
+        reset(start: nil)
+    }
+
+    private static func mappedCells(field: MagneticFieldMap, walkable: WalkableMap?) -> [Point2] {
+        var out: [Point2] = []
         for j in 0..<field.rows {
             for i in 0..<field.cols {
                 let c = Point2((Double(i) + 0.5) * field.cellCm, (Double(j) + 0.5) * field.cellCm)
                 guard field.sample(at: c) != nil else { continue }
                 if let w = walkable, !w.isWalkable(c) { continue }
-                mappedCells.append(c)
+                out.append(c)
             }
         }
-        reset(start: nil)
+        return out
+    }
+
+    /// 定位中途地图几何变了（挪了货架 / 墙 / 门、改了通道，NAV-001）：换成新的可走区域和射线模型，不重新开始。
+    /// 冷启动撒粒子的范围按新可走区域重算；落进新障碍物里的粒子挪到 2 m 内最近的可走处，挪不了的大幅降权。
+    /// 后台挑战者一起换。
+    public func replaceGeometry(walkable w: WalkableMap?, raycaster rc: ShelfRaycaster?) {
+        walkable = w
+        raycaster = rc
+        mappedCells = Self.mappedCells(field: field, walkable: w)
+        if let w {
+            for i in xs.indices {
+                let p = Point2(xs[i], ys[i])
+                guard !w.isWalkable(p) else { continue }
+                if let q = w.nearestWalkable(to: p, radiusCm: 200) {
+                    xs[i] = q.x; ys[i] = q.y
+                } else {
+                    logw[i] -= 20
+                }
+            }
+            normalize()
+        }
+        challenger?.replaceGeometry(walkable: w, raycaster: rc)
     }
 
     /// 有磁场数据的面积（m²），冷启动只在这里面找。
@@ -1743,6 +1794,12 @@ public final class MagneticLocalizer {
                                  uncertaintyCm: config.honestUncertainty && reportingUncertainty ? reportedUncertainty(at: c.center, clusterUnc: c.unc) : c.unc,
                                  confidence: conf, effectiveRatio: lastEffectiveRatio, updates: updateCount, converged: hasConverged)
         e.clusterUncertaintyCm = c.unc
+        // 后验航向只在对外报的时候算（内部的收敛 / 挑战者判定不需要，省一遍粒子）
+        if reportingUncertainty, let hb = clusterHeadingBias(center: c.center) {
+            e.headingBiasRad = hb.mean
+            e.headingBiasSigmaRad = hb.sigma
+            e.headingMultimodal = hb.multimodal
+        }
         // 房间：所有房间的权重一次算完，报权重最多的房间（不是加权平均点所在的房间——粒子分在两个房间时，
         // 平均点可能落在中间的走廊或离错的房间更近，正好是房间级兜底要管的情况）
         if config.reportRoom, let g = walkable?.rooms {
@@ -1756,6 +1813,41 @@ public final class MagneticLocalizer {
             }
         }
         return e
+    }
+
+    /// 主簇内（离 center ≤ clusterRadiusCm）粒子航向偏差的加权圆周统计（不能对角度做算术平均：±179° 平均成 0°）。
+    /// 多峰：36 格（10°）直方图上 ±30° 窗口的最大权重为主峰，离主峰 ≥ 90° 的窗口里最大权重 ≥ 0.2 即多峰。
+    func clusterHeadingBias(center: Point2) -> (mean: Double, sigma: Double, multimodal: Bool)? {
+        guard !xs.isEmpty else { return nil }
+        let mx = logw.max() ?? 0
+        let r2 = config.clusterRadiusCm * config.clusterRadiusCm
+        let nb = 36
+        var hist = [Double](repeating: 0, count: nb)
+        var sw = 0.0, sc = 0.0, ss = 0.0
+        for i in xs.indices {
+            let dx = xs[i] - center.x, dy = ys[i] - center.y
+            guard dx * dx + dy * dy <= r2 else { continue }
+            let w = exp(logw[i] - mx)
+            let c = cos(bias[i]), s = sin(bias[i])
+            sw += w; sc += w * c; ss += w * s
+            var a = bias[i].truncatingRemainder(dividingBy: 2 * Double.pi)   // 规范到 [−π, π)
+            if a < -Double.pi { a += 2 * Double.pi } else if a >= Double.pi { a -= 2 * Double.pi }
+            hist[min(Int((a + Double.pi) / (2 * Double.pi) * Double(nb)), nb - 1)] += w
+        }
+        guard sw > 0, sw.isFinite else { return nil }
+        let r = min(max((sc * sc + ss * ss).squareRoot() / sw, 1e-12), 1)
+        let sigma = (-2 * log(r)).squareRoot()
+        // ±30° 窗口（7 格）权重
+        var win = [Double](repeating: 0, count: nb)
+        for k in 0..<nb { for d in -3...3 { win[k] += hist[(k + d + nb) % nb] } }
+        for k in 0..<nb { win[k] /= sw }
+        let main = win.indices.max { win[$0] < win[$1] }!
+        var second = 0.0
+        for k in 0..<nb {
+            let sep = min(abs(k - main), nb - abs(k - main))          // 格数，1 格 = 10°
+            if sep >= 9 { second = max(second, win[k]) }
+        }
+        return (atan2(ss, sc), sigma, second >= 0.2)
     }
 
     /// 报的 1σ（cm，见 `ReportedUncertainty`）：√(全部粒子相对 p 的均方距离 + (步长散布缺口 · min(L, 地图边长))²)，不小于簇内散布

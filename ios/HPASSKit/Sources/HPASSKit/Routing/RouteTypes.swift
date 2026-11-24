@@ -84,6 +84,9 @@ public struct NavHint {
     /// 到下一个目标的距离（cm），后面没有目标时为 nil
     public var distanceToNextTarget: Double?
     public var isOffRoute: Bool
+    /// 产生这条播报的定位质量（`NavigationSession.onFix`；`onLocation` 当 reliable）。
+    /// 不是 reliable / degraded 时 direction 一律 .straight，界面不该出转向。
+    public var quality: FixQuality = .reliable
 
     public init(route: Route,
                 direction: TurnDirection,

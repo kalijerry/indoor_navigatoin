@@ -45,8 +45,11 @@ public enum NavInstruction {
         let side = shelf.flatMap { shelfSide(route: h.route, shelfCenter: $0.center) }
         let sideText = side == .left ? "左手边" : (side == .right ? "右手边" : "前方")
         let name = shelf.map { "货架 \($0.name)" } ?? "目标"
+        // 定位质量不够（NAV-004）：不出转向、不说到了
+        if h.quality.pausesNavigation { return "正在确认位置，请稍候" }
+        if h.quality == .coarse { return "位置还不太准，先朝目标方向走，还有约 \(meters(remain))" }
         if h.isOffRoute { return "偏离了路线，正在重新规划" }
-        if remain <= arriveCm {
+        if remain <= arriveCm && h.quality == .reliable {
             return shelf == nil ? "已到达目标" : "到了，\(name)在\(sideText)"
         }
         // 离终点太近的转弯不播，免得和到达提示重复
