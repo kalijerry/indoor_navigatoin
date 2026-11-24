@@ -20,8 +20,11 @@ extension MultiSessionFusion {
         public var mainComponentOnly: Bool
         /// 多遍互相对齐（SessionRegistration）：nil = 自动（没有通道中心线的地图才做；有通道的地图靠贴通道）
         public var registration: Bool?
-        public init(qualityGate: Bool = true, mainComponentOnly: Bool = true, registration: Bool? = nil) {
+        /// 每段自动对齐（SegmentRefinement，在多遍整体对齐之后）：nil = 环境变量 HPASS_SEGMENT_REFINE=1 时做（试验中）
+        public var segmentRefine: Bool?
+        public init(qualityGate: Bool = true, mainComponentOnly: Bool = true, registration: Bool? = nil, segmentRefine: Bool? = nil) {
             self.qualityGate = qualityGate; self.mainComponentOnly = mainComponentOnly; self.registration = registration
+            self.segmentRefine = segmentRefine
         }
         /// hpass-build 出云端地图包用的
         public static let cloud = ProductionOptions()
@@ -51,6 +54,12 @@ extension MultiSessionFusion {
         public var signObservations: Int
         /// 多遍互相对齐的修正（会话名 → 修正；没做对齐时为空）
         public var registration: [String: SessionRegistration.Rigid] = [:]
+        /// 每遍实际用的自动对齐修正（和输入一一对应，没做为 nil；有手动摆过的段时只作用在没摆过的部分），看板导出分段用
+        public var rigid: [SessionRegistration.Rigid?] = []
+        /// 不管手动摆放、整遍自动对齐的结果（看板「复位到自动对齐」用；没有手动摆放时和 rigid 一样）
+        public var autoRigid: [SessionRegistration.Rigid?] = []
+        /// 每段自动对齐的结果（会话名 → 段修改，作用在原始位置上；没做为空）
+        public var segmentAuto: [String: [SurveySegments.Edit]] = [:]
     }
 
     /// 云端出图流水线（见类型说明）。没有合格会话时返回 nil（云端不出图）。
@@ -59,6 +68,7 @@ extension MultiSessionFusion {
     /// - options: 哪些步骤做（云端 = .cloud，全做）
     public func buildProduction(_ sessions: [SurveySession], ble: [[BLESample]], signs: [[SignSample]] = [],
                                 tagPositions: [String: Point2] = [:], options: ProductionOptions = .cloud,
+                                edits: [String: SurveySegments.SessionEdits] = [:],
                                 onAllRejected: (([SessionQualityGate.Report]) -> Void)? = nil) -> ProductionBuild? {
         let n = sessions.count
         // 采集时质量打分判为差的时段，蓝牙读数也不用（磁场样本在 SurveyMapBuilder.prepare 里丢）
@@ -67,19 +77,73 @@ extension MultiSessionFusion {
             return sessions[k].qualityDrops.isEmpty ? b : b.filter { !sessions[k].qualityDropped($0.tMs) }
         }
         func bleOf(_ k: Int) -> [BLESample] { bleIn[k] }
+        // 手动分段修改（看板上拖过 / 删过的段，见 SurveySegments）：每遍融合都套上
+        var ed: [SurveySegments.SessionEdits?] = sessions.map { edits[$0.name] }
         // 第 1 遍：各会话原样对齐
-        var r1 = fuse(sessions)
+        var r1 = fuse(sessions, edits: ed)
         // 多遍互相对齐：按磁场 + 可走区域微调每遍的位置和朝向（见 SessionRegistration），之后每遍融合都套上
         var rigid: [SessionRegistration.Rigid?] = Array(repeating: nil, count: n)
+        var autoRigid = rigid
+        var segmentAuto: [String: [SurveySegments.Edit]] = [:]
         var registration: [String: SessionRegistration.Rigid] = [:]
         if options.registration ?? map.crosses.isEmpty, n > 0 {
             let reg = SessionRegistration(widthCm: map.width, heightCm: map.height, walkable: SessionEvaluator.walkable(map))
-            let rs = reg.solve(r1.samples.enumerated().map { k, ss in
-                .init(name: sessions[k].name, samples: ss.map { ($0.p, $0.f, $0.tMs) },
-                      fixed: SessionRegistration.Session.isMultiplyAnchored(sessions[k].anchors))
-            })
-            for (k, r) in rs.enumerated() where !r.isIdentity { rigid[k] = r; registration[sessions[k].name] = r }
-            if !registration.isEmpty { r1 = fuse(sessions, rigid: rigid) }
+            // pins：手动摆过的段固定不动（当参考），其余部分照常自动对齐
+            func solve(_ r: Result, pins: Bool) -> [SessionRegistration.Rigid?] {
+                var input: [SessionRegistration.Session] = []
+                var owner: [Int] = []
+                for (k, ss) in r.samples.enumerated() {
+                    let isPinned: (Int64) -> Bool = { t in pins && ed[k]?.pinned(t) != nil }
+                    let pinned = ss.filter { isPinned($0.tMs) }
+                    let free = ss.filter { !isPinned($0.tMs) }
+                    // 路上定过位置的遍（起点之外还有 reanchor）不整体挪，只当参考
+                    input.append(.init(name: sessions[k].name, samples: free.map { ($0.p, $0.f, $0.tMs) },
+                                       fixed: SessionRegistration.Session.isMultiplyAnchored(sessions[k].anchors))); owner.append(k)
+                    if !pinned.isEmpty { input.append(.init(name: sessions[k].name + "#pinned", samples: pinned.map { ($0.p, $0.f, $0.tMs) }, fixed: true)); owner.append(-1) }
+                }
+                var out: [SessionRegistration.Rigid?] = Array(repeating: nil, count: n)
+                for (i, x) in reg.solve(input).enumerated() where owner[i] >= 0 && !x.isIdentity { out[owner[i]] = x }
+                return out
+            }
+            rigid = solve(r1, pins: true)
+            // 看板「复位到自动对齐」要知道没手动摆的话自动对齐会放在哪：有摆过的段时另外不带手动位置解一遍（只给看板用）
+            if ed.contains(where: { $0?.hasPinned == true }) {
+                let delOnly = ed.map { $0.map { SurveySegments.SessionEdits(edits: $0.edits.filter(\.isDeleted)) } }
+                autoRigid = solve(fuse(sessions, edits: delOnly), pins: false)
+            } else {
+                autoRigid = rigid
+            }
+            for (k, r) in rigid.enumerated() { if let r { registration[sessions[k].name] = r } }
+            if !registration.isEmpty { r1 = fuse(sessions, rigid: rigid, edits: ed) }
+            // 每段自动对齐：在整遍对齐之后，每段再细调一点（相邻段首尾相接），结果当成「自动摆放」的段修改套上
+            if options.segmentRefine ?? (ProcessInfo.processInfo.environment["HPASS_SEGMENT_REFINE"] == "1") {
+                var pieces: [SegmentRefinement.Piece] = []
+                for (k, ss) in r1.samples.enumerated() {
+                    for sp in SurveySegments.split(r1.tracks[k]) {
+                        let mine = ss.filter { $0.tMs >= sp.t0Ms && $0.tMs <= sp.t1Ms }
+                        let th = SurveySegments.thin(mine, position: { $0.p })
+                        guard th.count >= 2 else { continue }
+                        let mid = sp.t0Ms + (sp.t1Ms - sp.t0Ms) / 2
+                        pieces.append(.init(session: k, t0Ms: sp.t0Ms, t1Ms: sp.t1Ms, samples: th.map { ($0.p, $0.f.total, $0.f.vertical) },
+                                            fixed: ed[k]?.pinned(mid) != nil))
+                    }
+                }
+                let moves = SegmentRefinement(walkable: SessionEvaluator.walkable(map)).solve(pieces)
+                var added: [Int: [SurveySegments.Edit]] = [:]
+                for (i, pc) in pieces.enumerated() where !pc.fixed && !moves[i].isIdentity {
+                    // 原始位置 → 整遍对齐 → 这段的细调，合成一个（转角 + 平移，pivot 0）
+                    let r = rigid[pc.session], mv = moves[i]
+                    func f(_ p: Point2) -> Point2 { mv.apply(r?.apply(p) ?? p) }
+                    let o = f(.zero)
+                    added[pc.session, default: []].append(.init(session: sessions[pc.session].name, t0Ms: pc.t0Ms, t1Ms: pc.t1Ms,
+                                                                dx: o.x, dy: o.y, rotDeg: (r?.rotDeg ?? 0) + mv.rotDeg))
+                    segmentAuto[sessions[pc.session].name, default: []].append(added[pc.session]!.last!)
+                }
+                if !added.isEmpty {
+                    for (k, a) in added { ed[k] = SurveySegments.SessionEdits(edits: (ed[k]?.edits ?? []) + a) }
+                    r1 = fuse(sessions, rigid: rigid, edits: ed)
+                }
+            }
         }
         // 货架标签：每条换成「人应该在那段货架前」的区域
         let shelfSigns = ShelfSigns(map: map, walkable: SessionEvaluator.walkable(map))
@@ -114,7 +178,7 @@ extension MultiSessionFusion {
             filters = Array(repeating: nil, count: n); keepIdx = Array(0..<n)
         } else {
         // 第 2 遍：带修正对齐，做质量检查
-        let r2 = fuse(sessions, corrections: corrections, rigid: rigid)
+        let r2 = fuse(sessions, corrections: corrections, rigid: rigid, edits: ed)
         for (k, s) in sessions.enumerated() {
             let others = MagneticFieldBuilder(widthCm: map.width, heightCm: map.height, cellCm: cellCm)
             var any = false
@@ -132,9 +196,10 @@ extension MultiSessionFusion {
         let kept = keepIdx.map { sessions[$0] }
         let keptCorr = keepIdx.map { corrections[$0] }
         let keptRigid = keepIdx.map { rigid[$0] }
+        let keptEd = keepIdx.map { ed[$0] }
         let keptBLE = keepIdx.enumerated().map { j, k in filters[j].map { f in bleOf(k).filter { f($0.tMs) } } ?? bleOf(k) }
         // 没筛、没修正时第 3 遍和第 1 遍一样，直接用
-        let r = !options.qualityGate && corrStats.isEmpty ? r1 : fuse(kept, filters: filters, corrections: keptCorr, rigid: keptRigid)
+        let r = !options.qualityGate && corrStats.isEmpty ? r1 : fuse(kept, filters: filters, corrections: keptCorr, rigid: keptRigid, edits: keptEd)
         // 和主体连不上的会话：整体偏移对不齐（可能差 10～16 µT），磁场图只用主体（分量 0）
         var rm = r
         let offMain = r.sessions.filter { $0.component != 0 }.map(\.name)
@@ -143,10 +208,10 @@ extension MultiSessionFusion {
             let main = r.sessions.indices.filter { r.sessions[$0].component == 0 }
             excluded = offMain
             rm = fuse(main.map { kept[$0] }, filters: main.map { filters[$0] }, corrections: main.map { keptCorr[$0] },
-                      rigid: main.map { keptRigid[$0] })
+                      rigid: main.map { keptRigid[$0] }, edits: main.map { keptEd[$0] })
         }
         return ProductionBuild(magnetic: rm, all: r, keptIndices: keepIdx, keptBLE: keptBLE, magExcluded: excluded, offMain: offMain,
                                quality: quality, corrections: corrStats, gate: gate, signObservations: nSigns,
-                               registration: registration)
+                               registration: registration, rigid: rigid, autoRigid: autoRigid, segmentAuto: segmentAuto)
     }
 }

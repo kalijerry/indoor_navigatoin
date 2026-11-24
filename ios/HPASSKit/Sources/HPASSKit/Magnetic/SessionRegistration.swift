@@ -76,7 +76,7 @@ public struct SessionRegistration {
     public struct Session {
         public var name: String
         public var samples: [(p: Point2, f: MagneticFeature, tMs: Int64)]
-        /// 不挪（路上定过位置），只当参考
+        /// 固定不动（手动摆好的段，或路上定过位置的遍）：当别人的参考，自己不挪
         public var fixed: Bool
         public init(name: String, samples: [(p: Point2, f: MagneticFeature, tMs: Int64)], fixed: Bool = false) {
             self.name = name; self.samples = samples; self.fixed = fixed

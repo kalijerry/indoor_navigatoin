@@ -9,7 +9,9 @@
    见 WorldMapKeeper）。挑同一张地图里最新的、坐标系和地图 JSON 一致的（两边都有 frameId 时比 frameId，
    否则比 arAlign 等价；规则同 WorldMapSidecar，见 cloud_build_lib.py），
    用 --worldmap 打进包；没有就沿用云端旧包里的（同样要 arAlign 等价）。≤15 MB，>8 MB 报告里警告；
-3. 会话（含实时记录）和上次融合时一样就跳过；否则跑 hpass-build（多会话偏移联合求解 + 蓝牙 + 覆盖率 + 测试会话精度），
+3. 看板「路线」页手动改过的段（/api/config/segments/<地图>）用 --edits 传给 hpass-build；每次都导出路线分段和着色
+   （--segments-out），传到 /api/segments/<地图> 给看板画；
+4. 会话（含实时记录）、手动分段修改都和上次融合时一样、看板也已经有分段数据就跳过；否则跑 hpass-build（多会话偏移联合求解 + 蓝牙 + 覆盖率 + 测试会话精度），
    上传地图包（版本 = 现在，盖过手机上生成的）和报告（/api/reports/build_<地图>_<时间>.json）。
 
 环境变量：HPASS_URL（后台地址）、HPASS_TOKEN（口令）、HPASS_BUILD（hpass-build 可执行文件路径）、
@@ -67,7 +69,7 @@ def package_meta(map_id, secs=None):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cloud_build_lib import (survey_summary, format_survey_summary, WM_FILE, WM_META, WM_WARN, WM_MAX, map_align, map_frame_id,  # noqa: E402
                              align_equivalent, worldmap_compatible, pick_worldmap,
-                             map_geometry_version, build_unchanged, quality_rejected)
+                             map_geometry_version, build_unchanged, quality_rejected, edits_hash)
 
 
 def main():
@@ -148,13 +150,30 @@ def main():
         picked = pick_worldmap(wm_dirs.get(mid, []), mid, align, frame_id)
         wm_session = picked[1]["session"] if picked else None
         geometry_version = map_geometry_version(map_json)
+        # 看板「路线」页手动改过的段
+        try:
+            seg_edits = get_json("/api/config/segments/" + urllib.parse.quote(mid)).get("edits") or []
+        except (urllib.error.HTTPError, ValueError, AttributeError):
+            seg_edits = []
+        ehash = edits_hash(seg_edits)
+        if seg_edits:
+            print(f"  看板手动分段修改 {len(seg_edits)} 条")
+        try:
+            req("/api/segments/" + urllib.parse.quote(mid), "GET")
+            have_segments = True
+        except urllib.error.HTTPError:
+            have_segments = False
         # 上次融合的输入：会话、实时记录、特征地图会话、地图几何版本（手机接着扫 / 重扫后只有它变）都没变才跳过
         last = [r for r in reports if r["key"].startswith(f"reports/build_{mid}_")]
         if last and not FORCE:
             prev = get_json("/api/" + last[0]["key"])
-            if build_unchanged(prev, names, live_names, wm_session, geometry_version):
-                print("  会话和地图几何都没变，跳过")
+            if build_unchanged(prev, names, live_names, wm_session, geometry_version) and prev.get("segmentEditsHash") == ehash and have_segments:
+                print("  会话、地图几何、手动分段修改都没变，跳过")
                 continue
+            if prev.get("segmentEditsHash") != ehash:
+                print("  看板改过路线分段，重建")
+            elif not have_segments:
+                print("  看板还没有路线分段数据，重建一次")
             if prev.get("mapGeometryVersion") != geometry_version:
                 print(f"  地图几何版本 {prev.get('mapGeometryVersion')} → {geometry_version}（手机接着扫 / 重扫过），重建")
         map_path = os.path.join(work, f"map_{mid}.json")
@@ -193,8 +212,14 @@ def main():
             pm["kind"] = pm.get("kind") or "store"
         out = os.path.join(work, f"{mid}.hpmp")
         rep = os.path.join(work, f"{mid}.json")
+        seg_out = os.path.join(work, f"{mid}.segments.json")
         cmd = [BUILD, "--map", map_path, "--sessions", ",".join(g["build"]), "--id", mid,
-               "--name", pm.get("name") or mid, "--kind", pm.get("kind") or "store", "--out", out, "--report", rep]
+               "--name", pm.get("name") or mid, "--kind", pm.get("kind") or "store", "--out", out, "--report", rep,
+               "--segments-out", seg_out]
+        if seg_edits:
+            ep = os.path.join(work, f"{mid}.edits.json")
+            json.dump({"version": 1, "mapId": mid, "edits": seg_edits}, open(ep, "w"))
+            cmd += ["--edits", ep]
         if g["test"]:
             cmd += ["--test", ",".join(g["test"])]
         if g["live"]:
@@ -206,6 +231,13 @@ def main():
         if pm.get("mapUpBearingDeg") is not None:
             cmd += ["--bearing", str(pm["mapUpBearingDeg"])]
         rc = subprocess.run(cmd).returncode
+        # 路线分段（全部没过质量筛选时也有，用户才能在看板上看哪段不对）
+        if os.path.exists(seg_out) and not DRY:
+            try:
+                req("/api/segments/" + urllib.parse.quote(mid), "PUT", open(seg_out, "rb").read(), {"Content-Type": "application/json"})
+                print("  已上传路线分段")
+            except urllib.error.HTTPError as e:
+                print(f"  路线分段上传失败（{e.code}），后台可能还没部署新版本")
         if rc == 3:
             print("  没有合格的会话（质量筛选全部没过），保留云端现有版本")
             continue
@@ -217,6 +249,7 @@ def main():
         report["worldMapSession"] = wm_session
         report["worldMap"] = wm_info
         report["mapGeometryVersion"] = geometry_version
+        report["segmentEditsHash"] = ehash
         pkg = open(out, "rb").read()
         if DRY:
             print(f"  试运行：地图包 {len(pkg) // 1024} KB，不上传")
