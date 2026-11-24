@@ -98,9 +98,18 @@ do {
         print(String(format: "蓝牙标签 / 货架标签修正 %@：蓝牙标签读数 %d、货架标签 %d，人−蓝牙标签中位 %.1f → %.1f m，最大挪动 %.1f m",
                      s.name, st.readings, st.signs ?? 0, st.beforeMedianM, st.afterMedianM, st.maxShiftM))
     }
+    if map.crosses.isEmpty {
+        let pinned = sessions.filter { SessionRegistration.Session.isMultiplyAnchored($0.anchors) }.map(\.name)
+        if !pinned.isEmpty { print("多遍对齐：\(pinned.count) 遍路上定过位置（起点之外还有锚点），不挪，只当参考") }
+    }
     for s in sessions {
         guard let g = pb.registration[s.name] else { continue }
-        let res = g.residualBefore.map { b in String(format: "，磁场残差 %.1f → %.1f µT", b, g.residualAfter ?? b) } ?? "，和别的遍重叠不够（只按可走区域）"
+        let res: String
+        switch (g.residualBefore, g.residualAfter) {
+        case let (b?, a?): res = String(format: "，磁场残差 %.1f → %.1f µT", b, a)
+        case let (nil, a?): res = String(format: "，原来和别的遍重叠不够、对齐后重叠上了（残差 %.1f µT）", a)
+        default: res = "，和别的遍重叠不够（只按可走区域）"
+        }
         print(String(format: "多遍对齐 %@：挪 %+.0f, %+.0f cm、转 %+.0f°%@，在可走区域里 %.0f%% → %.0f%%",
                      s.name, g.dx, g.dy, g.rotDeg, res, g.insideBefore * 100, g.insideAfter * 100))
     }

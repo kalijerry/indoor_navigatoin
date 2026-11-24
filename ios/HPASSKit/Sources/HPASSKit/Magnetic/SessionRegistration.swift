@@ -12,6 +12,10 @@ import Foundation
 ///    + 走出可走区域的比例 + 修正量的先验（起点误差约 0.75 m、朝向约 4°）；
 /// 3. 各遍同时更新（和会话顺序无关），每轮只往最优走一半，迭代几轮。
 /// 和别的遍重叠不够时只用「可走区域 + 先验」（把穿墙的轨迹拉回来）。
+///
+/// 只修「位置只靠起点 + 起步朝向」的遍。路上又定过位置（`Session.fixed`：起点之外还有 reanchor，
+/// 例如公开数据 ILC 每几秒一个真值路标点、App 里中途长按修正）的遍，轨迹在每个锚点处已经被钉住、分段对齐过，
+/// 误差不是一个整体的刚体偏差，整体挪只会把钉准的点挪走：这种遍不挪，只当别的遍的参考。
 public struct SessionRegistration {
     /// 一遍的刚体修正：p' = pivot + R(rot)(p − pivot) + shift
     public struct Rigid: Codable, Equatable {
@@ -72,8 +76,17 @@ public struct SessionRegistration {
     public struct Session {
         public var name: String
         public var samples: [(p: Point2, f: MagneticFeature, tMs: Int64)]
-        public init(name: String, samples: [(p: Point2, f: MagneticFeature, tMs: Int64)]) {
-            self.name = name; self.samples = samples
+        /// 不挪（路上定过位置），只当参考
+        public var fixed: Bool
+        public init(name: String, samples: [(p: Point2, f: MagneticFeature, tMs: Int64)], fixed: Bool = false) {
+            self.name = name; self.samples = samples; self.fixed = fixed
+        }
+
+        /// 起点之外还定过位置：start / reanchor 锚点里有两个以上不同的位置（相距 ≥ minSeparationCm）
+        public static func isMultiplyAnchored(_ anchors: [SurveySession.Anchor], minSeparationCm: Double = 50) -> Bool {
+            let pins = anchors.filter { $0.kind == "start" || $0.kind == "reanchor" }.map(\.map)
+            guard let first = pins.first else { return false }
+            return pins.contains { $0.distance(to: first) >= minSeparationCm }
         }
     }
 
@@ -99,7 +112,7 @@ public struct SessionRegistration {
         }
         let pivots = sessions.map { $0.samples.first?.p ?? .zero }
         var cur = pivots.map { Rigid.identity(pivot: $0) }
-        guard sessions.count > 1 || walkable != nil else { return cur }
+        guard sessions.contains(where: { !$0.fixed }), sessions.count > 1 || walkable != nil else { return cur }
         // 修正前：和别的遍（都不修正）比的残差、可走比例
         let before: [(res: Double?, inside: Double)] = sessions.indices.map { k in
             guard !thin[k].isEmpty else { return (nil, 1) }
@@ -109,7 +122,7 @@ public struct SessionRegistration {
         // 轮流更新（后面的对齐到前面挪过的）实测会让一串遍一起漂走
         for _ in 0..<config.rounds {
             var next = cur
-            for k in sessions.indices where !thin[k].isEmpty {
+            for k in sessions.indices where !thin[k].isEmpty && !sessions[k].fixed {
                 let b = search(thin[k], pivot: pivots[k], ref: reference(thin, cur, excluding: k))
                 next[k].dx += config.step * (b.dx - cur[k].dx)
                 next[k].dy += config.step * (b.dy - cur[k].dy)
@@ -117,7 +130,7 @@ public struct SessionRegistration {
             }
             cur = next
         }
-        for k in sessions.indices where !thin[k].isEmpty {
+        for k in sessions.indices where !thin[k].isEmpty && !sessions[k].fixed {
             cur[k].residualBefore = before[k].res
             cur[k].insideBefore = before[k].inside
             cur[k].residualAfter = reference(thin, cur, excluding: k).flatMap { residual(thin[k], cur[k], $0) }

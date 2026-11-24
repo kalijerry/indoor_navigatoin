@@ -75,7 +75,8 @@ extension MultiSessionFusion {
         if options.registration ?? map.crosses.isEmpty, n > 0 {
             let reg = SessionRegistration(widthCm: map.width, heightCm: map.height, walkable: SessionEvaluator.walkable(map))
             let rs = reg.solve(r1.samples.enumerated().map { k, ss in
-                .init(name: sessions[k].name, samples: ss.map { ($0.p, $0.f, $0.tMs) })
+                .init(name: sessions[k].name, samples: ss.map { ($0.p, $0.f, $0.tMs) },
+                      fixed: SessionRegistration.Session.isMultiplyAnchored(sessions[k].anchors))
             })
             for (k, r) in rs.enumerated() where !r.isIdentity { rigid[k] = r; registration[sessions[k].name] = r }
             if !registration.isEmpty { r1 = fuse(sessions, rigid: rigid) }
