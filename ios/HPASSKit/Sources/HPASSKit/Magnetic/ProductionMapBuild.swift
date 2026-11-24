@@ -96,7 +96,9 @@ extension MultiSessionFusion {
                     let isPinned: (Int64) -> Bool = { t in pins && ed[k]?.pinned(t) != nil }
                     let pinned = ss.filter { isPinned($0.tMs) }
                     let free = ss.filter { !isPinned($0.tMs) }
-                    input.append(.init(name: sessions[k].name, samples: free.map { ($0.p, $0.f, $0.tMs) })); owner.append(k)
+                    // 路上定过位置的遍（起点之外还有 reanchor）不整体挪，只当参考
+                    input.append(.init(name: sessions[k].name, samples: free.map { ($0.p, $0.f, $0.tMs) },
+                                       fixed: SessionRegistration.Session.isMultiplyAnchored(sessions[k].anchors))); owner.append(k)
                     if !pinned.isEmpty { input.append(.init(name: sessions[k].name + "#pinned", samples: pinned.map { ($0.p, $0.f, $0.tMs) }, fixed: true)); owner.append(-1) }
                 }
                 var out: [SessionRegistration.Rigid?] = Array(repeating: nil, count: n)
