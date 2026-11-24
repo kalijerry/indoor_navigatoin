@@ -75,6 +75,28 @@ public final class RoutePlanner {
         return nearestAislePoint(p) ?? p
     }
 
+    /// a → b 的直线是否不穿货架、不穿墙（到达判定用：人在货架背面 / 隔壁房间时，离目标直线很近但隔着东西）。
+    /// 每 10 cm 检查一次是否落在货架里（货架略往里收 2 cm，贴着货架边站不算穿过）；
+    /// 有可走栅格时，两端都在可走格上才检查一路可走，带房间图时不经门换房间算穿墙。
+    public func isLineClear(from a: Point2, to b: Point2) -> Bool {
+        guard a.x.isFinite, a.y.isFinite, b.x.isFinite, b.y.isFinite else { return false }
+        let d = a.distance(to: b)
+        let n = max(Int(d / 10), 1)
+        for k in 0...n {
+            let t = Double(k) / Double(n)
+            let p = Point2(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+            for s in shelves where s.width > 0 && s.height > 0 {
+                if RouteGeometry.rectContains(p, center: Point2(s.x, s.y), width: s.width, height: s.height,
+                                              rotationDeg: s.rotation, margin: -2) { return false }
+            }
+        }
+        if let w = grid?.walkable {
+            if w.isWalkable(a) && w.isWalkable(b) && !w.isSegmentClear(from: a, to: b) { return false }
+            if let g = w.rooms, g.crossesWithoutDoor(from: a, to: b) { return false }
+        }
+        return true
+    }
+
     /// 包含该点的货架；多个重叠时取面积较小者（更“贴身”的那个），完全相同则取先出现的。
     private func containingShelf(_ p: Point2) -> ShelfRect? {
         var best: ShelfRect? = nil

@@ -113,7 +113,8 @@ struct NavigateView: View {
                   route: shownRoute,
                   showFingerprints: false,
                   highlightShelf: nil,
-                  showHeading: demo ? true : (engine.isTracking || engine.headingEditing),
+                  // 后验航向不可信（多峰 / 散布大）时不画精确的朝向箭头（NAV-003）
+                  showHeading: demo ? true : ((engine.isTracking && !engine.headingUncertain) || engine.headingEditing),
                   positionStale: !demo && engine.locState == .lost,
                   headingEditing: !demo && engine.headingEditing,
                   onLongPress: longPress,
@@ -400,7 +401,8 @@ struct NavigateView: View {
         if engine.navArrived { return .arrived }
         guard let h = engine.navHint else { return .planning }
         if h.isOffRoute { return .offRoute }
-        guard let t = NavInstruction.nextTurn(h), t.distanceCm <= 1500 else { return .straight }
+        // 定位不够准时不出转向箭头（NAV-004）
+        guard h.quality.allowsTurnInstructions, let t = NavInstruction.nextTurn(h), t.distanceCm <= 1500 else { return .straight }
         switch t.direction {
         case .left: return .left
         case .right: return .right
@@ -413,8 +415,11 @@ struct NavigateView: View {
         if engine.navArrived { return "已到达" }
         guard let h = engine.navHint else { return engine.position == nil ? "等待定位…" : "正在规划路线…" }
         if h.isOffRoute { return "偏离路线，正在重新规划" }
-        if h.remainingDistance <= NavInstruction.arriveCm { return "已到达" }
-        if let t = NavInstruction.nextTurn(h), t.distanceCm <= 1500 {
+        if h.quality.pausesNavigation { return "正在确认位置…" }
+        if h.quality == .coarse { return "位置还不太准，先朝目标方向走" }
+        // 是否到达只看 engine.navArrived（ArrivalPolicy 连续确认过）；剩余里程短只说快到了
+        if h.remainingDistance <= NavInstruction.arriveCm { return "快到了" }
+        if h.quality.allowsTurnInstructions, let t = NavInstruction.nextTurn(h), t.distanceCm <= 1500 {
             let d = NavInstruction.meters(t.distanceCm)
             switch t.direction {
             case .left: return "\(d) 后左转"

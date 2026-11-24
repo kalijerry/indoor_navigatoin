@@ -16,8 +16,6 @@ private final class LivePipeline {
     static let divergeThresholdCm: Double = 300
     /// 标定用滚动缓冲保留多久
     static let calBufferMs: Int64 = 120_000
-    /// 剩余里程小于该值视为到达
-    static let arriveCm: Double = 120
 
     // 场地数据快照（启动时从 StoreDataStore 取一次）
     let points: [FingerprintPoint]
@@ -26,6 +24,9 @@ private final class LivePipeline {
     let positioner: FingerprintPositioner
     let fusion: FusionEngine
     let nav: NavigationSession
+    /// 到达判定（NAV-002）和定位质量（NAV-004）
+    var arrival = ArrivalPolicy()
+    var fixClassifier = FixQualityClassifier()
 
     // 最近状态
     var estimate: PositionEstimate?
@@ -62,7 +63,9 @@ private final class LivePipeline {
         self.tagToShelf = tagToShelf
         self.positioner = FingerprintPositioner(points: points, tagToShelf: tagToShelf, config: positioning)
         self.fusion = FusionEngine(map: map, config: fusionConfig)
-        self.nav = NavigationSession(planner: RoutePlanner(map: map, config: plannerConfig))
+        let planner = RoutePlanner(map: map, config: plannerConfig)
+        self.nav = NavigationSession(planner: planner)
+        self.arrival = ArrivalPolicy(lineClear: { a, b in planner.isLineClear(from: a, to: b) })
     }
 
     /// 当前用于显示的位置：开启 IMU 时用融合结果，否则用原始指纹结果。
@@ -348,9 +351,15 @@ final class LiveLocationEngine: ObservableObject {
     /// 把当前位置送进导航会话。
     private nonisolated func advanceNavigation(pipe: LivePipeline, position: Point2?) {
         guard pipe.nav.isActive, let p = position else { return }
-        guard let h = pipe.nav.onLocation(p) else { return }
+        let tMs = Int64((Date().timeIntervalSince1970 * 1000).rounded())
+        let unc = (pipe.useIMU ? pipe.fused?.uncertaintyCm : nil) ?? pipe.estimate?.uncertaintyCm ?? .infinity
+        let q = pipe.fixClassifier.classify(position: p, timestampMs: tMs, uncertaintyCm: unc, converged: true)
+        let fix = LocalizationFix(position: p, timestampMs: tMs, uncertaintyCm: unc, quality: q,
+                                  source: pipe.useIMU && pipe.fused != nil ? .pdr : .fingerprint)
+        guard let h = pipe.nav.onFix(fix) else { return }
         pipe.hint = h
-        if h.remainingDistance <= LivePipeline.arriveCm {
+        // 原来「投影剩余 ≤ 120 cm」一次就停（NAV-002）：现在要连续确认、定位可信、不隔货架
+        if pipe.arrival.evaluate(fix: fix, hint: h) == .arrived {
             AppLog.i("实时定位", "导航到达，剩余 \(Fmt.f(h.remainingDistance, 0)) cm")
             pipe.nav.stop()
         }
@@ -471,6 +480,7 @@ final class LiveLocationEngine: ObservableObject {
         isNavigating = true
         let from = displayPosition
         queue.async {
+            pipe.arrival.reset()
             let h = pipe.nav.start(targets: [target], from: from)
             pipe.hint = h
             if h == nil && from == nil {

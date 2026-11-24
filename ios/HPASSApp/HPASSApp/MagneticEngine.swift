@@ -40,6 +40,8 @@ private final class MagPipeline {
     var mode: MagneticEngine.Phase = .idle
 
     var latest: MagneticFeature?
+    /// raw 模式下磁力计特征的新鲜度门（NAV-005）：磁力计停了 / 回调被拖住 / 时间戳乱序时，旧特征不再当成新的磁场证据
+    var magGate = MagObservationGate()
     var calSamples: [MagneticFieldBuilder.TimedFeature] = []
     var lastCalSampleMs: Int64 = 0
 
@@ -286,7 +288,14 @@ final class MagneticEngine: ObservableObject {
     private var navFromFind = false
     private var nav: NavigationSession?
     private var navMapKey = ""
-    private static let navArriveCm: Double = 120
+    /// 到达判定（NAV-002）：连续确认、定位可信、离目标直线近、不隔货架 / 墙才算到
+    private var navArrival = ArrivalPolicy()
+    /// 定位质量（NAV-004）：导航按它决定出不出转向、要不要重新规划、能不能判到达
+    private var fixClassifier = FixQualityClassifier()
+    /// 当前定位质量（界面可以据此提示「正在确认位置」）
+    @Published private(set) var fixQuality: FixQuality = .searching
+    /// 航向不可信（粒子的后验航向多峰 / 散布太大，NAV-003）：不画精确的朝向箭头
+    @Published private(set) var headingUncertain = false
 
     /// 实时用的磁场来源（与地图一致）
     @Published private(set) var magSourceText = ""
@@ -524,6 +533,7 @@ final class MagneticEngine: ObservableObject {
         }
         position = nil
         trail = []
+        fixClassifier.reset()
         checks = []
         estimate = nil
         stepCount = 0
@@ -710,6 +720,7 @@ final class MagneticEngine: ObservableObject {
             locState = .searching
             position = nil
             trail = []
+            fixClassifier.reset()
             AppLog.i("地磁", "自动定位：等视觉认房间给起点（这张地图还没有磁场图）")
             return
         }
@@ -738,6 +749,7 @@ final class MagneticEngine: ObservableObject {
         locState = .searching
         position = nil
         trail = []
+        fixClassifier.reset()
         AppLog.i("地磁", "自动定位：冷启动，运动 计步，" + (MagneticConfig.magOnlyColdStartAllowed(mapAreaM2: Self.mapAreaM2) ? "小场地只靠地磁也报，" : "") + "地图朝向 " + (store.mapUpBearingDeg.map { "\(Int($0))°（一半粒子按罗盘，一半全方向）" } ?? "未设置（全方向猜）"))
     }
 
@@ -1485,6 +1497,7 @@ final class MagneticEngine: ObservableObject {
             pipe.vioPending = (useVIO && pipe.vioEnabled && headingKnown) ? .fresh(start!, heading!) : nil
         }
         trail = []
+        fixClassifier.reset()
         checks = []
         estimate = nil
         position = start
@@ -1514,15 +1527,19 @@ final class MagneticEngine: ObservableObject {
             lastError = "导航需要场地地图（障碍物和通道）"
             return
         }
-        let key = "\(map.shelves.count)/\(map.crosses.count)"
+        // 规划器按地图几何指纹缓存：原来只比货架数 / 通道数，挪了货架、改了通道走向但数量不变时继续用旧规划器（NAV-001）
+        let key = map.geometryHash
         if nav == nil || key != navMapKey {
             var cfg = RoutePlannerConfig()
             cfg.offRouteDistanceCm = 300          // 偏离 3 m 以上
             cfg.offRouteConfirmUpdates = 3        // 连续 3 次定位更新才重新规划
-            nav = NavigationSession(planner: RoutePlanner(shelves: map.shelves, crosses: map.crosses,
-                                                          walkable: MagMapStore.shared.walkableMap(), config: cfg))
+            let planner = RoutePlanner(shelves: map.shelves, crosses: map.crosses,
+                                       walkable: MagMapStore.shared.walkableMap(), config: cfg)
+            nav = NavigationSession(planner: planner)
+            navArrival = ArrivalPolicy(lineClear: { a, b in planner.isLineClear(from: a, to: b) })
             navMapKey = key
         }
+        navArrival.reset()
         targetId = nil
         hint = nil
         navLabel = label
@@ -1630,6 +1647,7 @@ final class MagneticEngine: ObservableObject {
             pipe.lastRawT = nil
             pipe.extractor.reset()
             pipe.latest = nil
+            pipe.magGate.reset()
             pipe.calSamples = []
             pipe.lastCalSampleMs = 0
             pipe.lastPublishMs = 0
@@ -1677,7 +1695,10 @@ final class MagneticEngine: ObservableObject {
                     pipe.magBias.addRaw(tMs: t, v)
                     // raw 模式：特征按原始磁力计的时刻算（重力方向来自加速度），不受 iOS 重新校准影响
                     if pipe.useRawMag, let m = pipe.biasTracker.corrected(v) ?? pipe.magBias.corrected(v) {
-                        pipe.latest = pipe.extractor.process(magnetic: m, tMs: t) ?? pipe.latest
+                        if let f = pipe.extractor.process(magnetic: m, tMs: t) {
+                            pipe.latest = f
+                            pipe.magGate.offer(f, tMs: t)
+                        }
                     }
                 }
             }
@@ -1763,7 +1784,8 @@ final class MagneticEngine: ObservableObject {
         if pipe.useRawMag {
             pipe.extractor.updateGravity(sample)
             if pipe.biasTracker.isReady || pipe.magBias.bias != nil {
-                feat = pipe.latest
+                // 只用 100 ms 以内的原始磁力计特征；磁力计停了这一刻就只靠计步（原来直接拿 pipe.latest，旧的会一直被重复用）
+                feat = pipe.magGate.current(at: s.tMs)
             } else if s.magValid {
                 // 偏置还没估出来（开始的前几秒）：先用校准后磁场
                 feat = pipe.extractor.process(magnetic: s.mag, tMs: s.tMs)
@@ -2034,7 +2056,11 @@ final class MagneticEngine: ObservableObject {
         guard phase == .localizing || (phase == .live && isTracking) else { return }
         estimate = est
         uncertaintyCm = uncertainty
-        if !headingEditing { headingRad = heading }
+        // 航向：有粒子滤波时用后验修正过的航向（粒子各自的航向偏差，主簇加权圆周均值，NAV-003）；
+        // 后验航向多峰 / 散布太大时不画精确箭头。没有粒子滤波（纯计步）时照旧用融合航向
+        let postHeading = est.flatMap { $0.correctedHeading(pdrHeadingRad: heading) }
+        headingUncertain = est != nil && postHeading == nil
+        if !headingEditing { headingRad = postHeading ?? heading }
         stepCount = steps
         feature = f
         // 显示平滑：小步移动取一半，蓝点连续滑动而不是一跳一跳；大跳（滤波切到别的簇、手动修正）直接到位
@@ -2055,12 +2081,30 @@ final class MagneticEngine: ObservableObject {
             if trail.count > Self.trailCapacity { trail.removeFirst(trail.count - Self.trailCapacity) }
         }
         refreshHint()
-        if let n = nav, n.isActive, let h = n.onLocation(shown) {
+        // 统一的定位结果（位置 + 质量），导航按质量决定行为（NAV-004）
+        let tMs = Int64((Date().timeIntervalSince1970 * 1000).rounded())
+        var fix: LocalizationFix
+        if let e = est {
+            fix = LocalizationFix.from(e, timestampMs: tMs, pdrHeadingRad: heading, classifier: &fixClassifier)
+        } else {
+            let q = fixClassifier.classify(position: p, timestampMs: tMs, uncertaintyCm: uncertainty, converged: true)
+            fix = LocalizationFix(position: p, timestampMs: tMs, headingRad: heading, uncertaintyCm: uncertainty,
+                                  quality: q, source: .pdr)
+        }
+        fix.position = shown
+        if fixQuality != fix.quality {
+            AppLog.i("地磁", "定位质量 \(fixQuality.rawValue) → \(fix.quality.rawValue)，不确定度 \(Int(uncertainty)) cm")
+            fixQuality = fix.quality
+        }
+        if let n = nav, n.isActive, let h = n.onFix(fix) {
             navHint = h
             navRoute = h.route
-            if h.remainingDistance <= Self.navArriveCm {
-                AppLog.i("地磁", "导航到达 \(navLabel ?? "")")
-                navArrivedText = NavInstruction.text(h, shelf: navShelf)
+            // 到达：原来「投影剩余 ≤ 120 cm」一次就停，人在货架背面 / 隔壁房间、定位跳一下都会误报（NAV-002）
+            if navArrival.evaluate(fix: fix, hint: h) == .arrived {
+                AppLog.i("地磁", "导航到达 \(navLabel ?? "")，离目标 \(Int(h.route.targetPoints.last.map { shown.distance(to: $0) } ?? 0)) cm")
+                var done = h
+                done.remainingDistance = 0                      // 到达播报（「到了，货架在右手边」）
+                navArrivedText = NavInstruction.text(done, shelf: navShelf)
                 n.stop()
                 navRoute = nil
                 navHint = nil
