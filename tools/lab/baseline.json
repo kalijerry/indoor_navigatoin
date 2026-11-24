@@ -236,21 +236,26 @@
   {
    "id": "public/imu/cold-mag-radio",
    "metrics": {
-    "replays": 75,
-    "points": 1137,
-    "median_cm": 570,
-    "p75_cm": 2440,
-    "p90_cm": 4400,
-    "wrong_fix": 0.56,
-    "within2m": 0.1231,
-    "coverage": 0.07,
-    "first_fix_m": 11.2,
-    "fixed_share": 0.36
+    "replays": 45,
+    "points": 487,
+    "median_cm": 1551.7,
+    "p75_cm": 4124.6,
+    "p90_cm": 6049.6,
+    "wrong_fix": 0.883,
+    "within2m": 0.0513,
+    "coverage": 0.0623,
+    "first_fix_m": 25.1,
+    "fixed_share": 0.2889,
+    "unc_ratio_p50": 2.449,
+    "within_1sigma": 0.2526,
+    "within_2sigma": 0.4251,
+    "path_ratio": 8.69,
+    "jumps3m_per_100m": 16.763
    },
    "office": {
     "all": {
-     "replays": 75,
-     "grid_points": 5445,
+     "replays": 45,
+     "grid_points": 3267,
      "room_correct": null,
      "room_correct_all": null,
      "wrong_room_adjacent": null,
@@ -259,19 +264,19 @@
      "door_latency_p50_s": null,
      "door_latency_p90_s": null,
      "door_miss": null,
-     "within1m_points": 0.0231,
-     "within1m_time": 0.0026,
-     "p50_cm": 513.7,
-     "p90_cm": 3475.9,
-     "coverage": 0.1052,
-     "ttff_s_p50": 67.0,
+     "within1m_points": 0.0288,
+     "within1m_time": 0.0021,
+     "p50_cm": 1414.9,
+     "p90_cm": 5872.2,
+     "coverage": 0.0747,
+     "ttff_s_p50": 72.0,
      "ttff_m_p50": 68.8,
-     "ttff_rate": 0.04,
-     "wrong_fix_before_first_correct": 0.36
+     "ttff_rate": 0.0,
+     "wrong_fix_before_first_correct": 0.38
     },
     "rooms": 0
    },
-   "note": "2026-11-09 固定 Swift 散列（SWIFT_DETERMINISTIC_HASHING）后的 pr 档结果，取自 PR #59 实验室评论（数值精确到 0.1 m / 1%）"
+   "note": "2026-11-24 只刷新这一个场景：按 main 9607f6c（#70 / #78 合并后）的结果，取 PR #80 的 Lab（pr 档 3 个种子，提交 56d3b87）。PR #79 / #80 没改定位代码，所有场景的数字和 #78 的 Lab 逐项相同；退步（中位 5.7 → 15.5 m）是在 main 上引入的，基线一直没跟上"
   },
   {
    "id": "public/imu/cold-wifi",
