@@ -67,7 +67,35 @@ public enum SurveySessionLoader {
         }
         var session = SurveySession(name: dir.lastPathComponent, imu: imu, raw: raw, poses: poses, anchors: anchors)
         session.qualityDrops = qualityDrops(dir)
+        session.appBias = appBias(dir)
         return session
+    }
+
+    /// 录制时 App 自己标定的磁力计偏置（µT）：meta.json 的 `mag_bias_ut`（App 0.1.37 起建图会话也写）；
+    /// 老会话没有，就从 log.txt 里找「开始录制：<会话名>」之前最近一次「存下本机磁力计偏置（…）：x, y, z µT」
+    /// （中间作废过存档就不算）。都没有 = nil（建图退回「原始 − iOS 校准」的中位数）。
+    public static func appBias(_ dir: URL) -> (Double, Double, Double)? {
+        if let d = try? Data(contentsOf: dir.appendingPathComponent("meta.json")),
+           let m = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+           let b = m["mag_bias_ut"] as? [Any], b.count >= 3,
+           let x = MapGeometry.num(b[0]), let y = MapGeometry.num(b[1]), let z = MapGeometry.num(b[2]) {
+            return (x, y, z)
+        }
+        guard let text = try? String(contentsOf: dir.appendingPathComponent("log.txt"), encoding: .utf8) else { return nil }
+        return appBias(log: text, session: dir.lastPathComponent)
+    }
+
+    static func appBias(log text: String, session: String) -> (Double, Double, Double)? {
+        let lines = text.split(separator: "\n").map(String.init)
+        guard let start = lines.firstIndex(where: { $0.contains("开始录制：\(session)") }) else { return nil }
+        for line in lines[..<start].reversed() {
+            if line.contains("偏置存档作废") { return nil }
+            guard line.contains("存下本机磁力计偏置"), let r = line.range(of: "）：") else { continue }
+            let nums = line[r.upperBound...].replacingOccurrences(of: "µT", with: "")
+                .split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+            return nums.count == 3 ? (nums[0], nums[1], nums[2]) : nil
+        }
+        return nil
     }
 
     /// ARKit 位姿时间和锚点（IMU）时间差了多少毫秒：锚点时刻 t 的 AR 坐标应该等于位姿在 t + off 的插值。

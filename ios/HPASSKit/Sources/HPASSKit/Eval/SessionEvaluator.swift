@@ -56,6 +56,15 @@ private func pct(_ a: [Double], _ q: Double) -> Double? {
 }
 
 public enum SessionEvaluator {
+    /// 会话录制时 App 标定的偏置，扣掉之后 |B| 在地磁正常范围才用（和建图 `SurveyMapBuilder.features` 同一条规则）；
+    /// 回放时用它扣原始磁力计 = App 有偏置存档时的实时定位
+    public static func usableAppBias(_ s: SurveySession) -> (Double, Double, Double)? {
+        guard let b = s.appBias, !s.raw.isEmpty,
+              HardIronCheck.medianField(raw: s.raw.map { $0.v }, bias: [b.0, b.1, b.2]).map(HardIronCheck.plausibleUT.contains) == true
+        else { return nil }
+        return b
+    }
+
     /// 建图方式
     public enum MapBuild {
         /// 和云端出图（hpass-build）完全一样：MultiSessionFusion.buildProduction —— 三遍融合（全局解偏移，和会话顺序无关）、
@@ -249,6 +258,9 @@ public enum SessionEvaluator {
 
     /// 逐点轨迹里带上粒子散布等诊断量（hpass-eval --diag-out）。默认关：每拍要多扫一遍粒子
     nonisolated(unsafe) public static var trackDiagnostics = false
+    /// 冷启动（真实计步）用罗盘：地图 +y 轴的罗盘方位（°，见 `MapBearingEstimator.estimateDeclination`）。
+    /// App 地图有朝向时冷启动就这样：惯导开罗盘、一半粒子信罗盘方向、一半整圆（MagneticEngine.makeColdStart）。nil = 不用
+    nonisolated(unsafe) public static var coldCompassDeclinationDeg: Double?
 
     /// `.pdrIMU` 回放用的惯导引擎：App 实时定位页同一份配置（`FusionEngine.live`，罗盘关），**不带通道约束**
     /// （输出只当增量送粒子滤波，见 `FusionConfig.live`）。
@@ -326,6 +338,7 @@ public enum SessionEvaluator {
         let sh = ShadowLocalizer(field: field, walkable: walkable, useRawMag: !s.raw.isEmpty, configure: configure, seed: seed,
                                 coldStartGate: coldStartGate, visualOdometry: !pdr,
                                 mapAreaM2: oracleStart ? nil : map.width * map.height / 10_000)
+        sh.fixedBias = Self.usableAppBias(s)
         sh.bleMap = ble
         sh.crossCheckEnabled = crossCheck
         // 真实计步：惯导引擎和 App 实时定位页同一份配置（FusionEngine.live，罗盘关）。
@@ -349,6 +362,10 @@ public enum SessionEvaluator {
                 seedAt = (r0.p, h)
                 sh.localizer.config = oracleTrackingConfig(odometry: odometry, headingKnown: h != nil, configure: configure)
                 sh.localizer.reset(start: r0.p, spreadCm: TrackingProfile.startSpreadCm, headingUnknown: h == nil)
+            } else if let decl = Self.coldCompassDeclinationDeg {
+                fusion = FusionEngine.live(corridors: [], start: Point2(map.width / 2, map.height / 2), headingRad: nil, compass: true,
+                                           stepLengthScale: stepLengthScale, declinationDeg: decl, carryMotion: carryMotion)
+                sh.localizer.reset(start: nil, headingUnknown: true, priorFraction: 0.5)
             } else {
                 fusion = Self.replayFusion(start: Point2(map.width / 2, map.height / 2), headingRad: 0, carryMotion: carryMotion,
                                            stepLengthScale: stepLengthScale)
@@ -432,10 +449,15 @@ public enum SessionEvaluator {
             cb(tp)
         }
         var lastFused: Point2?
+        var lastRawV: (t: Int64, v: (Double, Double, Double))?
         for (_, _, e) in evs {
             switch e {
-            case .imu(let x):
+            case .imu(var x):
                 sh.imu(x)
+                // App 有偏置存档时喂惯导的磁场 = 原始 − 偏置（不是 iOS 校准值）
+                if let b = sh.fixedBias, let r = lastRawV, abs(r.t - x.tMs) <= 30 {
+                    x.mx = r.v.0 - b.0; x.my = r.v.1 - b.1; x.mz = r.v.2 - b.2
+                }
                 guard let f = fusion, let out = f.process(x) else { continue }
                 // 参考轨迹开始之前（盲测会话：开始敲击、把手机放进口袋那几秒）的位移不推粒子：已知起点是参考轨迹的第一个点
                 if let r0 = ref.first, out.tMs < r0.tMs { lastFused = out.position; continue }
@@ -461,7 +483,9 @@ public enum SessionEvaluator {
                 if let est = sh.odometryStep(delta: d, tMs: out.tMs), let r = refAt(out.tMs) { score(est, r) }
                 if carryMotion { calibrator.step(deltaCm: d.length, engine: f, localizer: sh.localizer) }
                 track(out.tMs, odometry: out.position)
-            case .raw(let t, let v): sh.rawMag(tMs: t, v)
+            case .raw(let t, let v):
+                sh.rawMag(tMs: t, v)
+                lastRawV = (t, v)
             case .ble(let b): sh.bleReading(tMs: b.tMs, id: b.id, rssi: b.rssi)
             case .wifi(let w): sh.wifiScan(w)
             case .pose(let p):
@@ -521,6 +545,7 @@ public enum SessionEvaluator {
             return t - ref[lo].tMs > 300 ? nil : ref[lo].p
         }
         let sh = ShadowLocalizer(field: field, walkable: nil, useRawMag: !s.raw.isEmpty)
+        sh.fixedBias = Self.usableAppBias(s)
         enum Ev { case imu(IMUSample), raw(Int64, (Double, Double, Double)), pose(SurveySession.Pose) }
         var evs: [(Int64, Int, Ev)] = []
         for x in s.imu { evs.append((x.tMs, 0, .imu(x))) }

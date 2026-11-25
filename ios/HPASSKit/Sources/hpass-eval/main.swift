@@ -173,6 +173,25 @@ do {
     // unknown = 整圆撒开（口袋 / 包 / 摆臂，不把真值航向漏给滤波器）
     let shArg = arg("--start-heading") ?? "truth"
     guard let startHeading = SessionEvaluator.StartHeading(rawValue: shArg) else { print("--start-heading 只能是 truth 或 unknown"); exit(2) }
+    // 冷启动罗盘：和 App 一样，地图有朝向（房间图由云端建图按 MapBearingEstimator.estimateDeclination 估，商场图 --bearing / 建图估）
+    // 时惯导开罗盘、一半粒子信罗盘方向。这里从建图会话现估；--no-cold-compass = 老行为（整圆猜朝向）
+    if motion == .pdrIMU, map.crosses.isEmpty, !CommandLine.arguments.contains("--oracle-start"), !CommandLine.arguments.contains("--no-cold-compass") {
+        var ests: [(deg: Double, devDeg: Double, n: Int)] = []
+        for d in build {
+            guard let s = try? SurveySessionLoader.load(d, mapOriginOffsetCm: map.originOffsetCm) else { continue }
+            let tr = SurveyMapBuilder(widthCm: map.width, heightCm: map.height, crosses: map.crosses).add(s).track
+            if let e = MapBearingEstimator.estimateDeclination(session: s, track: tr, bias: SessionEvaluator.usableAppBias(s)) {
+                ests.append(e)
+                print(String(format: "  罗盘方位 %@：%.0f°（中位偏差 %.0f°，%d 段）", s.name, e.deg, e.devDeg, e.n))
+            }
+        }
+        if let v = arg("--cold-compass-deg").flatMap(Double.init) {
+            SessionEvaluator.coldCompassDeclinationDeg = v
+        } else if let b = MapBearingEstimator.combine(ests, maxDevDeg: MapBearingEstimator.roomMaxDevDeg) {
+            SessionEvaluator.coldCompassDeclinationDeg = b
+        }
+        print("冷启动罗盘：" + (SessionEvaluator.coldCompassDeclinationDeg.map { String(format: "地图 +y 方位 %.0f°（一半粒子信罗盘）", $0) } ?? "不用（整圆猜朝向）"))
+    }
     if motion == .pdrIMU { print("运动来源：真实 IMU 计步推算（FusionEngine）" + (CommandLine.arguments.contains("--oracle-start") ? "，起步朝向 \(startHeading.rawValue)" : "")) }
     // --track-out：每个运动节拍一行（会话、第几次、时刻、估计、是否有把握、不确定度、参考），给 tools/lab/office_metrics.py
     let trackOut = arg("--track-out")

@@ -592,6 +592,12 @@ final class SurveyEngine: ObservableObject {
         ]
         // 原点偏移 / 几何版本 / 坐标系身份（读会话时换算地图坐标）
         for (k, v) in MapLibrary.shared.sessionMapMeta { extraMeta[k] = v }
+        // 本机磁力计偏置（画 8 字校准 / 存档）：云端建图用它扣原始磁力计，不用「原始 − iOS 校准」的中位数
+        // （店里 iOS 校准会漂几十 µT，见 HPASSKit SurveySessionLoader.appBias）
+        if let b = MagBiasStore.loadValid() {
+            extraMeta["mag_bias_ut"] = b.bias
+            extraMeta["mag_bias_source"] = b.source
+        }
         recorder.extraMeta = extraMeta
         recorder.startRecording()
         guard recorder.isRecording, let dir = recorder.currentSessionDir else {
