@@ -71,6 +71,40 @@ final class SurveyMapBuilderTests: XCTestCase {
         XCTAssertFalse(rep.sampleTimes.contains { (T0 + 10_000)...(T0 + 20_000) ~= $0 })
     }
 
+    /// App 标定的偏置（appBias）在：建图用它扣原始磁力计，不用「原始 − iOS 校准」的中位数（iOS 校准偏了 20 µT 时后者就错 20 µT）
+    func testAppBiasBeatsIOSMedian() {
+        var s = session()
+        s.imu = s.imu.map { var x = $0; x.mx -= 20; return x }      // iOS 校准整体偏 20 µT → 中位数偏置偏 +20
+        let b = SurveyMapBuilder(widthCm: 1000, heightCm: 4400, crosses: crosses)
+        let (old, _) = b.prepare(s)
+        XCTAssertEqual(old.magSource, "raw")
+        XCTAssertEqual(old.bias?.0 ?? 0, 100, accuracy: 1)
+        s.appBias = (80, -110, -650)
+        let (rep, _) = b.prepare(s)
+        XCTAssertEqual(rep.magSource, "raw:app-bias")
+        XCTAssertEqual(rep.bias?.0 ?? 0, 80, accuracy: 1e-9)
+        // 偏置显然不对（扣掉之后 |B| 几百 µT）：不用，退回老办法
+        s.appBias = (380, -110, -650)
+        XCTAssertEqual(b.prepare(s).0.magSource, "raw")
+    }
+
+    /// 老会话 meta 里没有偏置：从 log.txt 找「开始录制：会话名」之前最近一次存档；中间作废过就不算
+    func testAppBiasFromLog() {
+        let log = """
+        22:45:44.167 [信息] 地磁: 存下本机磁力计偏置（calibrated）：-119, -61, -572 µT
+        22:45:45.285 [信息] 采集: 开始录制：ios_survey_A，仅标签 是
+        00:30:56.470 [警告] 地磁: 本机磁力计偏置存档作废（读数和地图磁场强度对不上，可能有磁吸附件），下次定位用 iOS 校准值
+        00:31:49.657 [信息] 采集: 开始录制：ios_survey_B，仅标签 是
+        00:31:58.659 [信息] 地磁: 存下本机磁力计偏置（calibrated）：42, 40, -456 µT
+        00:32:49.657 [信息] 采集: 开始录制：ios_survey_C，仅标签 是
+        """
+        let a = SurveySessionLoader.appBias(log: log, session: "ios_survey_A")
+        XCTAssertEqual(a?.0, -119); XCTAssertEqual(a?.2, -572)
+        XCTAssertNil(SurveySessionLoader.appBias(log: log, session: "ios_survey_B"))
+        XCTAssertEqual(SurveySessionLoader.appBias(log: log, session: "ios_survey_C")?.1, 40)
+        XCTAssertNil(SurveySessionLoader.appBias(log: log, session: "ios_survey_D"))
+    }
+
     func testSnapPullsTrackBackOntoCorridorAndImprovesField() {
         let s = session()
         let a = SurveyMapBuilder(widthCm: 1000, heightCm: 4400, crosses: crosses)

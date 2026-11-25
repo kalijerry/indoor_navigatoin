@@ -290,6 +290,22 @@ do {
             print(String(format: "地图朝向：%.0f°（之前 %@）", b, bearing.map { String(format: "%.0f°", $0) } ?? "没有"))
             bearing = b
         }
+    } else {
+        // 房间图（办公室、小店）：用 App 冷启动同一套惯导罗盘（原始磁力计 − App 偏置）估。以前房间图没有朝向，
+        // App 冷启动只能整圆猜朝向，磁场平的直道上会认成反方向走。App 里 declinationDeg = 上方 + 180
+        var ests: [(deg: Double, devDeg: Double, n: Int)] = []
+        for (j, k) in keepIdx.enumerated() where j < r.tracks.count && k < sessions.count {
+            let s = sessions[k]
+            if let e = MapBearingEstimator.estimateDeclination(session: s, track: r.tracks[j], bias: SessionEvaluator.usableAppBias(s)) {
+                ests.append(e)
+                print(String(format: "  罗盘方位 %@：地图 +y %.0f°（中位偏差 %.0f°，%d 段）", s.name, e.deg, e.devDeg, e.n))
+            }
+        }
+        if let d = MapBearingEstimator.combine(ests, maxDevDeg: MapBearingEstimator.roomMaxDevDeg) {
+            let b = (d + 180).truncatingRemainder(dividingBy: 360)
+            print(String(format: "地图朝向（惯导罗盘）：上方 %.0f°（之前 %@）", b, bearing.map { String(format: "%.0f°", $0) } ?? "没有"))
+            bearing = b
+        }
     }
     // 视觉特征地图（房间）：云端脚本已经挑好、确认过坐标系和地图的 arAlign 一致，这里只管大小
     var worldMap: Data?

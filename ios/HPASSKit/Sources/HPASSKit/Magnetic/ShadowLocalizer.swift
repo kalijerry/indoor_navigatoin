@@ -15,6 +15,9 @@ public final class ShadowLocalizer {
 
     private let extractor = MagneticFeatureExtractor()
     private let bias = RawBiasTracker()
+    /// App 标定的本机偏置（µT）：有就一直用它扣原始磁力计，不再按「原始 − iOS 校准」现估
+    /// （App 实时定位有偏置存档时就是这样，见 meta `mag_calibration` = app_hard_iron）。评估器按会话的 `appBias` 设
+    public var fixedBias: (Double, Double, Double)?
     private var lastRaw: (t: Int64, v: (Double, Double, Double))?
     private var latest: MagneticFeature?
     /// 最近一次的磁场特征（诊断用：量读数和地图的残差）
@@ -76,7 +79,9 @@ public final class ShadowLocalizer {
 
     public func imu(_ s: IMUSample) {
         extractor.updateGravity(s)
-        if useRawMag {
+        if useRawMag && fixedBias != nil {
+            // 原始磁力计逐个出特征（rawMag），这里只更新重力
+        } else if useRawMag {
             if let r = lastRaw, abs(r.t - s.tMs) <= 30 { bias.add(tMs: s.tMs, raw: r.v, calibrated: (s.mx, s.my, s.mz)) }
             if !bias.isReady { latest = extractor.process(magnetic: (s.mx, s.my, s.mz), tMs: s.tMs) ?? latest }
         } else {
@@ -86,7 +91,9 @@ public final class ShadowLocalizer {
 
     public func rawMag(tMs: Int64, _ v: (Double, Double, Double)) {
         lastRaw = (tMs, v)
-        if useRawMag, let m = bias.corrected(v) { latest = extractor.process(magnetic: m, tMs: tMs) ?? latest }
+        if useRawMag, let b = fixedBias {
+            latest = extractor.process(magnetic: (v.0 - b.0, v.1 - b.1, v.2 - b.2), tMs: tMs) ?? latest
+        } else if useRawMag, let m = bias.corrected(v) { latest = extractor.process(magnetic: m, tMs: tMs) ?? latest }
     }
 
     public func bleReading(tMs: Int64, id: String, rssi: Double) {

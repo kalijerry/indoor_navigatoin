@@ -30,6 +30,10 @@ public struct SurveySession {
     public var anchors: [Anchor]
     /// 采集时质量打分判为差的时段（毫秒，含前后扩展，见 CollectionQualityMonitor / quality.json）：这些时刻的样本不用
     public var qualityDrops: [ClosedRange<Int64>] = []
+    /// App 自己标定的磁力计硬铁偏置（µT，设备系；画 8 字校准 / 存档，见 `SurveySessionLoader.appBias`）。
+    /// 有就用它去偏置，不用「原始 − iOS 校准」的中位数：iOS 校准在店里会漂几十 µT（Tesco 2026-11-25：
+    /// 一次会话里 z 在 −379～−619 之间晃，中位数和画 8 字的差 36 µT，同一条通道一去一回 |B| 差 15 µT）
+    public var appBias: (Double, Double, Double)?
 
     /// 这个时刻采集时被判为质量差
     public func qualityDropped(_ t: Int64) -> Bool { qualityDrops.contains { $0.contains(t) } }
@@ -432,8 +436,14 @@ public final class SurveyMapBuilder {
             rep.magSource = "calibrated"
             return out
         }
-        // 偏置 = 原始 − 校准 的中位数（整次会话）
         let raw = s.raw.sorted { $0.tMs < $1.tMs }
+        if let b = s.appBias, HardIronCheck.medianField(raw: raw.map { $0.v }, bias: [b.0, b.1, b.2]).map(HardIronCheck.plausibleUT.contains) == true {
+            // App 标定的偏置：扣掉之后 |B| 在地磁正常范围才用（偏置在录制前就变了的话退回下面的老办法）
+            rep.bias = b
+            rep.magSource = "raw:app-bias"
+            return rawFeatures(raw, imu: imu, bias: b, ex: ex)
+        }
+        // 偏置 = 原始 − 校准 的中位数（整次会话）
         var dx: [Double] = [], dy: [Double] = [], dz: [Double] = []
         var j = 0
         for x in imu {
@@ -447,12 +457,18 @@ public final class SurveyMapBuilder {
         }
         rep.bias = (bx, by, bz)
         rep.magSource = "raw"
-        // 时间顺序：加速度更新重力方向，原始磁力计逐个出特征
+        return rawFeatures(raw, imu: imu, bias: (bx, by, bz), ex: ex)
+    }
+
+    /// 原始磁力计扣掉固定偏置出特征（时间顺序：加速度更新重力方向，原始磁力计逐个出特征）
+    private func rawFeatures(_ raw: [(tMs: Int64, v: (Double, Double, Double))], imu: [IMUSample],
+                             bias b: (Double, Double, Double), ex: MagneticFeatureExtractor) -> [(Int64, MagneticFeature)] {
+        var out: [(Int64, MagneticFeature)] = []
         var k = 0
         for r in raw {
             while k < imu.count && imu[k].tMs <= r.tMs { ex.updateGravity(imu[k]); k += 1 }
             guard k > 0 else { continue }
-            if let f = ex.process(magnetic: (r.v.0 - bx, r.v.1 - by, r.v.2 - bz), tMs: r.tMs) { out.append((r.tMs, f)) }
+            if let f = ex.process(magnetic: (r.v.0 - b.0, r.v.1 - b.1, r.v.2 - b.2), tMs: r.tMs) { out.append((r.tMs, f)) }
         }
         return out
     }

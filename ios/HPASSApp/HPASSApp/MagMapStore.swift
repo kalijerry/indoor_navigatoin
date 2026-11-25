@@ -43,6 +43,8 @@ final class MagMapStore: ObservableObject {
     /// 地图的真实朝向：地图 +y 轴的磁罗盘方位角（度）。第一次「定点 + 设朝向」时自动记下，之后冷启动用。
     /// 地图朝向：地图「上方」（−y）指向的罗盘方位（度，顺时针，0 = 北）。由用户填写，例如 316。
     @Published private(set) var mapUpBearingDeg: Double?
+    /// 地图朝向是用户在手机上手填的（true）还是云端建图自动估的 / 没有（false）。手填的装云端包时不被覆盖（MapLibrary）
+    @Published private(set) var mapUpBearingManual = false
     /// 融合引擎用的「地图 +y 轴的罗盘方位」= 上方 + 180°。
     var declinationDeg: Double? { mapUpBearingDeg.map { ($0 + 180).truncatingRemainder(dividingBy: 360) } }
     private var walkableCache: WalkableMap?
@@ -146,6 +148,7 @@ final class MagMapStore: ObservableObject {
     func reloadFromDisk() {
         points = []
         mapUpBearingDeg = nil
+        mapUpBearingManual = false
         importedField = nil
         magSource = "calibrated"
         crosses = []
@@ -169,6 +172,7 @@ final class MagMapStore: ObservableObject {
         let norm = deg.map { (($0.truncatingRemainder(dividingBy: 360)) + 360).truncatingRemainder(dividingBy: 360) }
         guard norm != mapUpBearingDeg else { return }
         mapUpBearingDeg = deg.map { (($0.truncatingRemainder(dividingBy: 360)) + 360).truncatingRemainder(dividingBy: 360) }
+        mapUpBearingManual = deg != nil   // 清空 = 回到云端自动估的
         save()
         AppLog.i("地磁", "地图朝向：" + (mapUpBearingDeg.map { "上方指向 \(Fmt.f($0, 0))°" } ?? "未设置"))
     }
@@ -288,6 +292,7 @@ final class MagMapStore: ObservableObject {
             "markPoints": points.map { ["id": $0.id, "x": Int($0.x.rounded()), "y": Int($0.y.rounded())] as [String: Any] },
         ]
         if let d = mapUpBearingDeg { root["mapUpBearingDeg"] = d }
+        if mapUpBearingManual { root["mapUpBearingManual"] = true }
         if let f = field { root["magField"] = f.jsonObject() }
         root["magSource"] = builder.sampleCount > 0 ? "calibrated" : magSource
         if builder.sampleCount > 0 {
@@ -317,6 +322,7 @@ final class MagMapStore: ObservableObject {
            let d = root["mapUpBearingDeg"] as? Double {
             // 旧版本存过一个错误的「magDeclinationDeg」（常常是 0），不再读取
             mapUpBearingDeg = d
+            mapUpBearingManual = root["mapUpBearingManual"] as? Bool ?? false
         }
         walkableCache = nil
         importedField = try StoreDataLoader.loadMagneticField(data)

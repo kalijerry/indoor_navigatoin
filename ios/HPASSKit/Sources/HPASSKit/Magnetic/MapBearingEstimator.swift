@@ -38,6 +38,54 @@ public enum MapBearingEstimator {
         return (m, dev[dev.count / 2], vals.count)
     }
 
+    /// 用 App 冷启动同一套惯导罗盘估「地图 +y 轴的罗盘方位」（= `FusionConfig.magneticDeclinationDeg`，
+    /// App 里 `MagMapStore.declinationDeg` = 地图上方方位 + 180）：惯导（罗盘开、磁偏角 0）跑一遍会话，
+    /// 每 ~1 m 的推算位移方向和对齐好的轨迹方向之差，取圆周均值。
+    ///
+    /// 磁力计用「原始 − App 标定的偏置」（`bias`，App 有偏置存档时实时定位就是这样喂惯导的）；没有偏置返回 nil。
+    /// 房间图（办公室、小店）以前不估朝向（只用 heading.csv 估、而且只给有通道的商场图），冷启动只能整圆猜朝向，
+    /// 在磁场平、走直线的地方分不清来回两个方向（Tesco 2026-11-25：估计点和真人反着走）。
+    public static func estimateDeclination(session s: SurveySession, track: [(tMs: Int64, p: Point2)],
+                                           bias: (Double, Double, Double)?) -> (deg: Double, devDeg: Double, n: Int)? {
+        // 只在有 App 标定偏置时估：没有偏置的磁场（iOS 校准、公开数据集的 Android 校准值）罗盘不可靠，
+        // Lab 公开 ILC 冷启动场景用它估了朝向反而退步（public/imu/cold-mag-radio 5.7 → 13.0 m）
+        guard let bias, track.count > 20, !s.imu.isEmpty, !s.raw.isEmpty else { return nil }
+        let f = FusionEngine.live(corridors: [], start: .zero, headingRad: nil, compass: true, declinationDeg: 0)
+        let raw = s.raw.sorted { $0.tMs < $1.tMs }
+        var out: [(tMs: Int64, p: Point2)] = []
+        var j = 0
+        for var x in s.imu.sorted(by: { $0.tMs < $1.tMs }) {
+            while j + 1 < raw.count && raw[j + 1].tMs <= x.tMs { j += 1 }
+            guard abs(raw[j].tMs - x.tMs) <= 30 else { continue }
+            x.mx = raw[j].v.0 - bias.0; x.my = raw[j].v.1 - bias.1; x.mz = raw[j].v.2 - bias.2
+            if let o = f.process(x) { out.append((o.tMs, o.position)) }
+        }
+        guard out.count > 20 else { return nil }
+        func at(_ t: Int64) -> Point2? {
+            var lo = 0, hi = out.count - 1
+            guard t >= out[lo].tMs, t <= out[hi].tMs else { return nil }
+            while hi - lo > 1 { let m = (lo + hi) / 2; if out[m].tMs <= t { lo = m } else { hi = m } }
+            return out[lo].p
+        }
+        var vals: [Double] = []
+        for k in stride(from: 10, to: track.count, by: 5) {
+            let d = track[k].p - track[k - 10].p
+            guard d.length > 80, let e1 = at(track[k].tMs), let e0 = at(track[k - 10].tMs) else { continue }
+            let e = e1 - e0
+            guard e.length > 50 else { continue }
+            vals.append(norm((atan2(d.x, d.y) - atan2(e.x, e.y)) * 180 / .pi))
+        }
+        guard vals.count >= 30 else { return nil }
+        let m = circularMean(vals)
+        let dev = vals.map { angDiff($0, m) }.sorted()
+        return (m, dev[dev.count / 2], vals.count)
+    }
+
+    /// 惯导罗盘估的（`estimateDeclination`）会话能接受的中位偏差（°）。罗盘稳的场地才给朝向：
+    /// Tesco（2026-11-25）6°，冷启动用罗盘后留一法 6.4 → 3.1 m；办公室 11～21°（各会话估的朝向差 37°），
+    /// 用罗盘时冷启动有的会话变差（2.5 → 3.4 m），整体不变，所以不给。只在这两个场地上量过，是经验值
+    public static let roomMaxDevDeg = 10.0
+
     /// 多个会话：中位偏差 ≤ maxDevDeg 的会话里，取和其余会话最一致的那一组的圆周均值
     public static func combine(_ xs: [(deg: Double, devDeg: Double, n: Int)], maxDevDeg: Double = 12, agreeDeg: Double = 20) -> Double? {
         let good = xs.filter { $0.devDeg <= maxDevDeg }

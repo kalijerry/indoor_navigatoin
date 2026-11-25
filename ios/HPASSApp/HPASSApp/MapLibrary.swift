@@ -383,10 +383,16 @@ final class MapLibrary: ObservableObject {
         var root: [String: Any] = ["mapId": 1, "floorId": 1, "floorName": parsed.floorName ?? m.name,
                                    "width": parsed.width, "height": parsed.height,
                                    "mapElementList": [Any](), "markPoints": [Any](), "magSource": m.magSource ?? "raw"]
-        // 手机上填的地图朝向、放的点位，云端包里没有就保留本机的
+        // 手机上手填的地图朝向优先（云端对房间图会自动估一个，不能把手填的冲掉）；没手填就用云端包的，云端也没有就保留本机的。
+        // 放的点位，云端包里没有就保留本机的
         let oldRoot = (try? Data(contentsOf: ws.appendingPathComponent("magmap.json")))
             .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-        if let b = m.mapUpBearingDeg ?? (oldRoot?["mapUpBearingDeg"] as? Double) { root["mapUpBearingDeg"] = b }
+        if oldRoot?["mapUpBearingManual"] as? Bool == true, let b = oldRoot?["mapUpBearingDeg"] as? Double {
+            root["mapUpBearingDeg"] = b
+            root["mapUpBearingManual"] = true
+        } else if let b = m.mapUpBearingDeg ?? (oldRoot?["mapUpBearingDeg"] as? Double) {
+            root["mapUpBearingDeg"] = b
+        }
         if let pts = oldRoot?["markPoints"] { root["markPoints"] = pts }
         if let f = c.field { root["magField"] = f.jsonObject() }
         try JSONSerialization.data(withJSONObject: root).write(to: ws.appendingPathComponent("magmap.json"), options: .atomic)
