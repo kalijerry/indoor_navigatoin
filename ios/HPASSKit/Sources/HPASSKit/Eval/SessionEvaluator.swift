@@ -261,6 +261,11 @@ public enum SessionEvaluator {
     /// 冷启动（真实计步）用罗盘：地图 +y 轴的罗盘方位（°，见 `MapBearingEstimator.estimateDeclination`）。
     /// App 地图有朝向时冷启动就这样：惯导开罗盘、一半粒子信罗盘方向、一半整圆（MagneticEngine.makeColdStart）。nil = 不用
     nonisolated(unsafe) public static var coldCompassDeclinationDeg: Double?
+    /// 已知起点跟踪时也开罗盘（实验，hpass-eval --track-compass）：惯导按这个地图 +y 罗盘方位慢慢往罗盘拉。nil = 不用
+    nonisolated(unsafe) public static var trackCompassDeclinationDeg: Double?
+    /// 已知起点时起点先验的散布（cm，实验，hpass-eval --start-spread）：模拟「从门口进店」（≈ 3 m）、「进店前 GPS 粗定位」（≈ 10 m）。
+    /// nil = 跟踪档的 `TrackingProfile.startSpreadCm`
+    nonisolated(unsafe) public static var oracleStartSpreadCm: Double?
 
     /// `.pdrIMU` 回放用的惯导引擎：App 实时定位页同一份配置（`FusionEngine.live`，罗盘关），**不带通道约束**
     /// （输出只当增量送粒子滤波，见 `FusionConfig.live`）。
@@ -358,10 +363,15 @@ public enum SessionEvaluator {
         if pdr {
             if oracleStart, let r0 = ref.first {
                 let h = startHeading == .truth ? Self.truthHeading(ref) : nil
-                fusion = Self.replayFusion(start: r0.p, headingRad: h ?? 0, carryMotion: carryMotion, stepLengthScale: stepLengthScale)
+                if let decl = Self.trackCompassDeclinationDeg {
+                    fusion = FusionEngine.live(corridors: [], start: r0.p, headingRad: h ?? 0, compass: true,
+                                               stepLengthScale: stepLengthScale, declinationDeg: decl, carryMotion: carryMotion)
+                } else {
+                    fusion = Self.replayFusion(start: r0.p, headingRad: h ?? 0, carryMotion: carryMotion, stepLengthScale: stepLengthScale)
+                }
                 seedAt = (r0.p, h)
                 sh.localizer.config = oracleTrackingConfig(odometry: odometry, headingKnown: h != nil, configure: configure)
-                sh.localizer.reset(start: r0.p, spreadCm: TrackingProfile.startSpreadCm, headingUnknown: h == nil)
+                sh.localizer.reset(start: r0.p, spreadCm: Self.oracleStartSpreadCm ?? TrackingProfile.startSpreadCm, headingUnknown: h == nil)
             } else if let decl = Self.coldCompassDeclinationDeg {
                 fusion = FusionEngine.live(corridors: [], start: Point2(map.width / 2, map.height / 2), headingRad: nil, compass: true,
                                            stepLengthScale: stepLengthScale, declinationDeg: decl, carryMotion: carryMotion)

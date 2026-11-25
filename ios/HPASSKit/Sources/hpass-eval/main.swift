@@ -106,6 +106,9 @@ do {
         print("建图 \(r.name)：样本 \(r.samplesUsed)" + off + (r.warnings.isEmpty ? "" : "，⚠️ \(r.warnings.joined(separator: "；"))"))
     }
     for x in built.rejected { print("建图不用 \(x.name)：\(x.reason)") }
+    if let f = field.flatness() {
+        print(String(format: "磁场平坦度：1 m 起伏中位 %.1f µT，%.0f%% 的地方 < 2 µT", f.contrastMedianUT, f.flatShare * 100))
+    }
     var summary = "建图：\(build.count) 个会话，"
     summary += mapMode == .production ? "合格 \(build.count - built.rejected.count) 个" : "不做质量筛选"
     summary += "，\(built.components) 个连通分量"
@@ -175,7 +178,9 @@ do {
     guard let startHeading = SessionEvaluator.StartHeading(rawValue: shArg) else { print("--start-heading 只能是 truth 或 unknown"); exit(2) }
     // 冷启动罗盘：和 App 一样，地图有朝向（房间图由云端建图按 MapBearingEstimator.estimateDeclination 估，商场图 --bearing / 建图估）
     // 时惯导开罗盘、一半粒子信罗盘方向。这里从建图会话现估；--no-cold-compass = 老行为（整圆猜朝向）
-    if motion == .pdrIMU, map.crosses.isEmpty, !CommandLine.arguments.contains("--oracle-start"), !CommandLine.arguments.contains("--no-cold-compass") {
+    let trackCompass = CommandLine.arguments.contains("--track-compass")
+    SessionEvaluator.oracleStartSpreadCm = arg("--start-spread").flatMap(Double.init)
+    if motion == .pdrIMU, map.crosses.isEmpty, trackCompass || !CommandLine.arguments.contains("--oracle-start"), !CommandLine.arguments.contains("--no-cold-compass") {
         var ests: [(deg: Double, devDeg: Double, n: Int)] = []
         for d in build {
             guard let s = try? SurveySessionLoader.load(d, mapOriginOffsetCm: map.originOffsetCm) else { continue }
@@ -190,6 +195,7 @@ do {
         } else if let b = MapBearingEstimator.combine(ests, maxDevDeg: MapBearingEstimator.roomMaxDevDeg) {
             SessionEvaluator.coldCompassDeclinationDeg = b
         }
+        if trackCompass { SessionEvaluator.trackCompassDeclinationDeg = SessionEvaluator.coldCompassDeclinationDeg; print("跟踪罗盘：\(SessionEvaluator.trackCompassDeclinationDeg.map { String(format: "%.0f°", $0) } ?? "地图没朝向，不用")") }
         print("冷启动罗盘：" + (SessionEvaluator.coldCompassDeclinationDeg.map { String(format: "地图 +y 方位 %.0f°（一半粒子信罗盘）", $0) } ?? "不用（整圆猜朝向）"))
     }
     if motion == .pdrIMU { print("运动来源：真实 IMU 计步推算（FusionEngine）" + (CommandLine.arguments.contains("--oracle-start") ? "，起步朝向 \(startHeading.rawValue)" : "")) }
