@@ -584,7 +584,9 @@ struct MagneticView: View {
                     }
                 Text("°")
             }
-            Text("地图上方指向的罗盘方位（0 = 北，90 = 东）。填了之后，自动定位会先按这个方向猜，更快找到你；不填也能用，只是慢一些。")
+            Text("地图上方指向的罗盘方位（0 = 北，90 = 东）。房间图云端建图会用采集时的罗盘自动估（罗盘稳的场地才有），一般不用填；"
+                 + "手填的优先，装云端地图时不会被覆盖，清空就回到自动值。有朝向时自动定位一半粒子按罗盘方向猜。"
+                 + (store.mapUpBearingManual ? "（现在是手填的）" : (store.mapUpBearingDeg != nil ? "（现在是自动估的）" : "")))
                 .font(.footnote).foregroundStyle(.secondary)
             NavigationLink { DataManagerView() } label: {
                 Label("数据管理（会话、轨迹、网格、AR 记录）", systemImage: "externaldrive")

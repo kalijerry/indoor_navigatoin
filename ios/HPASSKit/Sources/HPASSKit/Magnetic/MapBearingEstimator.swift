@@ -42,22 +42,22 @@ public enum MapBearingEstimator {
     /// App 里 `MagMapStore.declinationDeg` = 地图上方方位 + 180）：惯导（罗盘开、磁偏角 0）跑一遍会话，
     /// 每 ~1 m 的推算位移方向和对齐好的轨迹方向之差，取圆周均值。
     ///
-    /// 磁力计用「原始 − App 标定的偏置」（`bias`，App 有偏置存档时实时定位就是这样喂惯导的），没有才用 iOS 校准值。
+    /// 磁力计用「原始 − App 标定的偏置」（`bias`，App 有偏置存档时实时定位就是这样喂惯导的）；没有偏置返回 nil。
     /// 房间图（办公室、小店）以前不估朝向（只用 heading.csv 估、而且只给有通道的商场图），冷启动只能整圆猜朝向，
     /// 在磁场平、走直线的地方分不清来回两个方向（Tesco 2026-11-25：估计点和真人反着走）。
     public static func estimateDeclination(session s: SurveySession, track: [(tMs: Int64, p: Point2)],
                                            bias: (Double, Double, Double)?) -> (deg: Double, devDeg: Double, n: Int)? {
-        guard track.count > 20, !s.imu.isEmpty else { return nil }
+        // 只在有 App 标定偏置时估：没有偏置的磁场（iOS 校准、公开数据集的 Android 校准值）罗盘不可靠，
+        // Lab 公开 ILC 冷启动场景用它估了朝向反而退步（public/imu/cold-mag-radio 5.7 → 13.0 m）
+        guard let bias, track.count > 20, !s.imu.isEmpty, !s.raw.isEmpty else { return nil }
         let f = FusionEngine.live(corridors: [], start: .zero, headingRad: nil, compass: true, declinationDeg: 0)
         let raw = s.raw.sorted { $0.tMs < $1.tMs }
         var out: [(tMs: Int64, p: Point2)] = []
         var j = 0
         for var x in s.imu.sorted(by: { $0.tMs < $1.tMs }) {
-            if let b = bias, !raw.isEmpty {
-                while j + 1 < raw.count && raw[j + 1].tMs <= x.tMs { j += 1 }
-                guard abs(raw[j].tMs - x.tMs) <= 30 else { continue }
-                x.mx = raw[j].v.0 - b.0; x.my = raw[j].v.1 - b.1; x.mz = raw[j].v.2 - b.2
-            }
+            while j + 1 < raw.count && raw[j + 1].tMs <= x.tMs { j += 1 }
+            guard abs(raw[j].tMs - x.tMs) <= 30 else { continue }
+            x.mx = raw[j].v.0 - bias.0; x.my = raw[j].v.1 - bias.1; x.mz = raw[j].v.2 - bias.2
             if let o = f.process(x) { out.append((o.tMs, o.position)) }
         }
         guard out.count > 20 else { return nil }
