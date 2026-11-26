@@ -65,6 +65,43 @@ public struct MagneticFieldMap {
     }
 
     /// 在 p 处做双线性插值（以格子中心为采样点）。周围有效格子的权重不足 0.25 时返回 nil。
+    /// 地图在 p 处的 1 m 起伏（µT）：所在格子和 8 个方向 1 m 外的格子三个分量差的 RMS 的平均（至少 2 个方向有数据）。
+    /// 衡量「挪 1 m 读数会变多少」：越小磁场越平、地磁越分不出位置。没有数据时 nil。
+    /// 有数据区域的边上只有一侧邻居，会显得平一些（4 µT/m 的均匀梯度里最外一圈约 1.9 µT）
+    public func localContrast(at p: Point2) -> Double? {
+        guard p.x >= 0, p.y >= 0 else { return nil }
+        let i = Int(p.x / cellCm), j = Int(p.y / cellCm)
+        guard i < cols, j < rows, let f = cells[j * cols + i] else { return nil }
+        let n = max(Int((100 / cellCm).rounded()), 1)
+        var sum = 0.0, cnt = 0
+        for (di, dj) in [(n, 0), (-n, 0), (0, n), (0, -n), (n, n), (-n, -n), (n, -n), (-n, n)] {
+            let ii = i + di, jj = j + dj
+            guard ii >= 0, jj >= 0, ii < cols, jj < rows, let g = cells[jj * cols + ii] else { continue }
+            let l = (Double(di * di + dj * dj)).squareRoot() * cellCm / 100
+            let d0 = g.total - f.total, d1 = g.vertical - f.vertical, d2 = g.horizontal - f.horizontal
+            sum += ((d0 * d0 + d1 * d1 + d2 * d2) / 3).squareRoot() / max(l, 1)
+            cnt += 1
+        }
+        return cnt >= 2 ? sum / Double(cnt) : nil
+    }
+
+    /// 整张图的平坦度：各格 1 m 起伏（`localContrast`）的中位数，和起伏 < `flatThresholdUT` 的格子占比。
+    /// 实测（docs/flat-field-localization.md）：办公室中位 4.4 µT、平的 11%；Tesco 1.2 µT、84%；10 月门店 1.8 µT、57%。
+    /// 起伏中位 < 2 µT 的图上地磁对跟踪几乎没帮助（留一法关掉地磁误差不变），冷启动要走 ~20 m 才认得出位置。格子不到 20 个时 nil
+    public static let flatThresholdUT: Double = 2
+    public func flatness() -> (contrastMedianUT: Double, flatShare: Double, cells: Int)? {
+        var cs: [Double] = []
+        for j in 0..<rows {
+            for i in 0..<cols where cells[j * cols + i] != nil {
+                if let c = localContrast(at: Point2((Double(i) + 0.5) * cellCm, (Double(j) + 0.5) * cellCm)) { cs.append(c) }
+            }
+        }
+        guard cs.count >= 20 else { return nil }
+        cs.sort()
+        let flat = Double(cs.filter { $0 < Self.flatThresholdUT }.count) / Double(cs.count)
+        return (cs[cs.count / 2], flat, cs.count)
+    }
+
     public func sample(at p: Point2) -> (mean: MagneticFeature, sigma: MagneticFeature)? {
         guard contains(p) else { return nil }
         let fx = p.x / cellCm - 0.5

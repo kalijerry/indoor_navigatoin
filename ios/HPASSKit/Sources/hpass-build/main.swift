@@ -51,6 +51,9 @@ struct Report: Encodable {
     var segments: [String: Int]?
     /// 手动分段修改的条数（看板「路线」页；云端按它判断要不要重建）
     var segmentEdits: Int?
+    /// 磁场平坦度（`MagneticFieldMap.flatness`）：1 m 起伏中位（µT）、起伏 < 2 µT 的格子占比
+    var fieldContrastMedianUT: Double?
+    var fieldFlatShare: Double?
 }
 
 guard let mapPath = arg("--map"), let out = arg("--out"), let id = arg("--id") else {
@@ -337,6 +340,14 @@ do {
     try pkg.write(to: URL(fileURLWithPath: out))
     print("地图包 \(pkg.count / 1024) KB → \(out)")
     var warnings: [String] = wmWarnings
+    let flat = rm.field.flatness()
+    if let f = flat {
+        print(String(format: "磁场平坦度：1 m 起伏中位 %.1f µT，%.0f%% 的地方 < %.0f µT", f.contrastMedianUT, f.flatShare * 100, MagneticFieldMap.flatThresholdUT))
+        if f.contrastMedianUT < MagneticFieldMap.flatThresholdUT {
+            warnings.append(String(format: "磁场很平（1 m 起伏中位 %.1f µT，%.0f%% 的地方 < 2 µT）：地磁基本只能粗定位，跟踪主要靠计步和墙；", f.contrastMedianUT, f.flatShare * 100)
+                            + "建议在图上画出货架 / 通道，每条通道来回各走一遍，冷启动要多走一段（约 20 m）才认得出位置")
+        }
+    }
     if !magExcluded.isEmpty { warnings.append("磁场图没用（和主体重叠不够）：\(magExcluded.joined(separator: "、"))；补采一段重叠后自动加入") }
     if let rp = arg("--report") {
         let rep = Report(mapId: id, name: meta.name, version: meta.version, sessions: rm.sessions, components: r.components,
@@ -345,7 +356,9 @@ do {
                          tagMismatches: tagMismatches, quality: quality, corrections: corrStats,
                          zones: zoneStatus, nextZone: nextZone, nextZoneEntry: nextEntry, magExcluded: magExcluded, live: liveReport,
                          registration: pb.registration.isEmpty ? nil : pb.registration,
-                         segments: segmentCounts, segmentEdits: editSet?.edits.count)
+                         segments: segmentCounts, segmentEdits: editSet?.edits.count,
+                         fieldContrastMedianUT: flat.map { ($0.contrastMedianUT * 100).rounded() / 100 },
+                         fieldFlatShare: flat.map { ($0.flatShare * 1000).rounded() / 1000 })
         let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         try enc.encode(rep).write(to: URL(fileURLWithPath: rp))
     }
