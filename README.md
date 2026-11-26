@@ -193,8 +193,8 @@ python -m unittest discover -s tools/tests
 
 ## Icon
 
-The app icon and logo are original artwork: a location pin over magnetic field isolines, with a trail of footsteps
-(dead reckoning) leading to it. Sources: [`docs/assets/app-icon.svg`](docs/assets/app-icon.svg) (full-bleed, iOS) and
+The app icon and logo are original artwork: a two-tone navigation arrow styled as a compass needle (magnetics +
+navigation) over faint concentric field rings. Sources: [`docs/assets/app-icon.svg`](docs/assets/app-icon.svg) (full-bleed, iOS) and
 [`docs/assets/logo.svg`](docs/assets/logo.svg) (rounded). The iOS asset catalog and Android launcher icons are rendered
 from them.
 
@@ -235,4 +235,4 @@ Android：`cd android && ./gradlew assembleDebug`；Python 工具：`python -m u
 
 ### 图标
 
-原创：定位图钉压在磁场等值线上，一串脚印（惯导推算）走向它。源文件在 `docs/assets/`，iOS 和 Android 的图标都由它导出。
+原创：红白双色的导航箭头，形似指南针针头（地磁 + 导航），背后是淡淡的磁场同心圈。源文件在 `docs/assets/`，iOS 和 Android 的图标都由它导出。
